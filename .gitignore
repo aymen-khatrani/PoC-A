@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/input/*
+data/output/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+logs/*
+!logs/.gitkeep
+*.xlsx
+*.xlsm
+!tests/fixtures/*.xlsx
