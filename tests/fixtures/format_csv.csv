@@ -1,0 +1,11 @@
+Key;Requirement;Kind;Expected_Flag
+1;SAFETY REQUIREMENTS;Heading;NO
+CUS-101;The braking system shall stop the train within 250 m from 80 km/h on dry rails, verified by test procedure TP-14.;Technical Req;NO
+CUS-102;The supplier shall deliver the maintenance manual in PDF format before the Factory Acceptance Test.;Technical Req;NO
+CUS-103;The cabinet shall weigh 45 kg plus or minus 2 kg, measured with a calibrated scale.;Technical Req;NO
+CUS-104;The door shall open when the train speed is 0 km/h and the platform side is detected by sensor S12.;Technical Req;NO
+CUS-201;The system should respond rapidly and be user-friendly.;Technical Req;YES
+CUS-202;The equipment shall be maximally modular and maintained as quickly as possible.;Non-Technical Req;YES
+CUS-203;The interface shall be robust and handle errors appropriately, if necessary.;Technical Req;YES
+CUS-204;The supplier shall provide adequate documentation and support as required.;Non-Technical Req;YES
+2;See the applicable standards list.;Information;NO

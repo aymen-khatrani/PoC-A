@@ -1,1059 +1,489 @@
-# Controleur de qualite des exigences
+# Contrôleur de qualité des exigences
 
-## PoC 1 - Analyse hybride par regles et LLM local
+Analyse la qualité rédactionnelle d'un export d'exigences client
+et produit un rapport Excel exploitable en revue.
 
-Ce projet est un prototype local de controle qualite d'exigences client exportees depuis IBM DOORS au format Excel.
+L'outil combine trois niveaux, dans cet ordre de responsabilité :
 
-L'outil analyse des exigences redigees en anglais afin de detecter des formulations potentiellement :
+```text
+Moteur de règles  ->  détecte et prouve
+LLM local         ->  contextualise et suggère
+Humain            ->  décide et valide
+```
 
-- ambigues ;
-- incompletes ;
-- non verifiables ;
-- faiblement obligatoires ;
-- non atomiques ;
-- dependantes de conditions ou references non definies ;
-- insuffisamment quantifiees ;
-- susceptibles de necessiter une clarification avec le client.
-
-Le prototype combine trois niveaux de traitement :
-
-1. un moteur de regles deterministe et explicable ;
-2. un LLM local execute avec Ollama pour l'analyse contextuelle ;
-3. une validation humaine obligatoire avant toute reformulation ou ouverture de risque.
-
-> Le prototype est une aide a la revue. Il ne remplace pas l'expertise metier, ne modifie pas automatiquement les exigences du client et ne doit pas creer ou communiquer un risque sans validation humaine.
+> C'est une aide à la revue. L'outil ne modifie jamais le texte du
+> client, n'invente aucune valeur, n'ouvre aucun risque et
+> n'envoie rien au client sans validation humaine.
 
 ---
 
-## 1. Objectif du projet
+## 1. Ce que l'outil accepte en entrée
 
-L'objectif du PoC est de verifier si une solution locale peut accelerer la premiere revue d'un export d'exigences client tout en conservant :
+N'importe quel tableau d'exigences, sans configuration préalable :
 
-- le texte original sans modification ;
-- l'identifiant DOORS de chaque objet ;
-- une preuve textuelle pour chaque alerte ;
-- une explication de la detection ;
-- une question de clarification proposee ;
-- une reformulation en brouillon ;
-- une proposition de risque soumise a validation humaine ;
-- une trace des performances et erreurs techniques.
+| Variabilité du fichier client | Traitement |
+|---|---|
+| Noms de colonnes quelconques | Détectés par alias, en français et en anglais |
+| Plusieurs feuilles, feuilles parasites | La feuille dont l'en-tête est le plus reconnaissable est retenue |
+| En-tête précédé d'un titre ou d'un logo | Ligne d'en-tête réelle détectée dans les 20 premières lignes |
+| Absence de colonne d'identifiant | Identifiants `ROW-<ligne Excel>` générés, avec avertissement |
+| Absence de colonne de type | Les intitulés sont repérés par heuristique de texte |
+| Intitulé et corps dans deux colonnes | Les deux sont analysés ensemble |
+| Vocabulaire de types inconnu | Tout type inconnu est analysé, seule la structure documentaire est écartée |
+| Identifiants dupliqués | Conservés, analysés et signalés |
+| Export CSV ou texte délimité | Séparateur détecté automatiquement |
+| Texte rédigé dans une autre langue | Analysé, avec avertissement explicite |
 
-Le PoC doit repondre a la question suivante :
+Formats de fichier : `.xlsx`, `.xlsm`, `.csv`, `.tsv`, `.txt`.
 
-> Une combinaison de regles explicites et d'un LLM local permet-elle d'identifier utilement des exigences de mauvaise qualite avant leur analyse detaillee par les equipes projet ?
-
----
-
-## 2. Perimetre du PoC 1
-
-### Inclus
-
-- lecture d'un export Excel DOORS ;
-- recherche automatique des colonnes utiles ;
-- filtrage des objets selon leur type ;
-- analyse des exigences techniques et non techniques ;
-- application d'un catalogue de regles en anglais ;
-- creation d'un resultat detaille par anomalie ;
-- creation d'un resume par exigence ;
-- analyse contextuelle facultative avec un LLM Ollama ;
-- generation de questions de clarification ;
-- generation de reformulations avec des placeholders ;
-- preparation d'un brouillon de risque ;
-- export des resultats dans un nouveau fichier Excel ;
-- mesure des temps, tokens et erreurs ;
-- test sur dix exigences selectionnees par le manager.
-
-### Hors perimetre actuel
-
-- modification automatique de DOORS ;
-- validation contractuelle automatique ;
-- envoi automatique de questions au client ;
-- ouverture automatique d'un risque officiel ;
-- authentification d'entreprise ;
-- gestion multi-utilisateur ;
-- deploiement sur une VM ou un serveur ;
-- interface Streamlit finalisee ;
-- API FastAPI integree au pipeline ;
-- RAG et base vectorielle ;
-- traitement LLM systematique de toutes les exigences.
+Chaque détection automatique peut être forcée en ligne de commande.
+**Aucune ligne n'est écartée en silence** : toute ligne non analysée
+figure dans la feuille `Excluded_Rows` du rapport avec son motif.
 
 ---
 
-## 3. Architecture fonctionnelle
+## 2. Installation
 
-```text
-Export Excel DOORS
-        |
-        v
-Chargement des colonnes A, B et C
-        |
-        v
-Filtrage par ObjectType
-        |
-        +--> Technical Req
-        +--> Non-Technical Req
-        |
-        v
-Moteur de regles Python
-        |
-        +--> anomalies lexicales
-        +--> anomalies structurelles
-        +--> preuves et gravites
-        |
-        v
-Selection des exigences a approfondir
-        |
-        v
-LLM local Ollama / qwen2.5:3b
-        |
-        +--> confirmation ou rejet des alertes
-        +--> revue contextuelle
-        +--> informations manquantes
-        +--> questions de clarification
-        +--> reformulations en brouillon
-        +--> proposition de risque
-        |
-        v
-Validation humaine
-        |
-        v
-Rapport Excel enrichi
+```bash
+python -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
 ```
 
-Principe de responsabilite :
-
-```text
-Moteur de regles = detecter et prouver
-LLM              = contextualiser et suggerer
-Humain           = decider et valider
-```
-
----
-
-## 4. Format d'entree
-
-Le prototype cherche automatiquement une feuille contenant les trois colonnes suivantes :
-
-| Colonne | Nom | Utilisation |
-|---|---|---|
-| A | `ID` | Identifiant unique de l'objet DOORS |
-| B | `Object Heading and Object Text` | Texte anglais a analyser |
-| C | `ObjectType` | Type de l'objet |
-
-Types analyses :
-
-```text
-Technical Req
-Non-Technical Req
-```
-
-Types ignores par le moteur principal :
-
-```text
-Heading
-Information
-Type absent
-```
-
-L'export de reference utilise la feuille `ViewRich`.
-
-Le texte original est conserve. Les traitements de normalisation servent uniquement a la recherche et ne remplacent pas le contenu importe.
-
----
-
-## 5. Structure du projet
-
-```text
-Controleur de qualite PoC 1/
-|
-|-- README.md
-|-- requirements.txt
-|-- load_excel.py
-|-- run_analysis.py
-|-- test_manager_requirements.py
-|
-|-- rules/
-|   |-- rules_en.csv
-|
-|-- src/
-|   |-- __init__.py
-|   |-- excel_loader.py          # selon l'organisation retenue
-|   |-- rule_loader.py
-|   |-- rule_engine.py
-|   |-- llm_analyzer.py
-|
-|-- data/
-|   |-- input/
-|   |   |-- 10_examples_CONCEPT DESIGN.CUS.xlsx
-|   |
-|   |-- output/
-|
-|-- tests/
-|-- logs/
-|
-|-- .venv/
-```
-
-Selon la version du projet, le chargeur Excel peut se trouver :
-
-```text
-load_excel.py
-```
-
-ou :
-
-```text
-src/excel_loader.py
-```
-
-Les scripts fournis recherchent les deux organisations.
-
----
-
-## 6. Prerequis
-
-### Systeme
-
-- Windows avec PowerShell ;
-- Python 3.14 actuellement utilise dans le PoC ;
-- Ollama installe localement ;
-- Microsoft Excel recommande pour consulter les rapports.
-
-### Modele local
-
-Modele de generation actuellement utilise :
-
-```text
-qwen2.5:3b
-```
-
-Modele d'embedding installe mais non utilise dans le PoC 1 :
-
-```text
-bge-m3:latest
-```
-
-Le modele d'embedding sera utile uniquement lors d'une future evolution RAG.
-
----
-
-## 7. Installation
-
-### 7.1 Creer l'environnement virtuel
+Sous Windows PowerShell, sans activer l'environnement :
 
 ```powershell
 & "C:\Program Files\Python314\python.exe" -m venv .venv
-```
-
-Si PowerShell interdit l'activation, il n'est pas necessaire de modifier durablement la politique d'execution. Utiliser directement le Python de l'environnement :
-
-```powershell
-.\.venv\Scripts\python.exe --version
-```
-
-### 7.2 Installer les dependances
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-```
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install pandas openpyxl pytest streamlit ollama
-```
-
-Exemple de `requirements.txt` :
-
-```text
-pandas
-openpyxl
-pytest
-streamlit
-ollama
-```
-
-Installation depuis le fichier :
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### 7.3 Installer le modele Ollama
+Pour l'analyse LLM, en plus :
 
-```powershell
+```bash
 ollama pull qwen2.5:3b
 ```
 
-Verifier les modeles :
+Le mode règles seules **ne nécessite pas** Ollama ni le paquet
+`ollama` : l'import n'a lieu que si `--llm` est demandé.
 
-```powershell
-ollama list
+---
+
+## 3. Utilisation
+
+### Analyse par règles
+
+```bash
+python run_analysis.py -i mon_export.xlsx
 ```
 
-Tester l'API Ollama :
+Le rapport est écrit dans `data/output/` avec un horodatage.
 
-```powershell
-Invoke-RestMethod `
-  -Uri "http://localhost:11434/api/tags" `
-  -Method Get
+### Forcer une colonne mal détectée
+
+```bash
+python run_analysis.py -i export.xlsx \
+    --text-column "Requirement Description" \
+    --id-column "Req. ID"
+```
+
+### Choisir ce qui est analysé
+
+```bash
+# uniquement certains types
+python run_analysis.py -i export.xlsx --include-types "Technical Req" "SYS-REQ"
+
+# tout sauf certains types
+python run_analysis.py -i export.xlsx --exclude-types "Information" "Figure"
+```
+
+La comparaison ignore la casse et les accents. Pour éviter qu'un
+filtre `Technical Req` attrape aussi `Non-Technical Req`, la
+correspondance partielle n'est acceptée qu'en préfixe de mot.
+
+### Ajouter le LLM sur les cas prioritaires
+
+```bash
+python run_analysis.py -i export.xlsx --llm --llm-limit 20
+```
+
+Les exigences sont classées par gravité puis par score qualité
+croissant : les plus douteuses passent en premier. `--llm-limit -1`
+envoie tout, `--llm-include-clean` envoie aussi les exigences sans
+alerte en revue contextuelle complète.
+
+### Mesurer la performance
+
+```bash
+# méthode recommandée : une colonne d'attendu avec des cas corrects
+python evaluate.py -i reference.xlsx --expected-column Expected_Flag
+
+# ou une liste d'identifiants problématiques
+python evaluate.py -i export.xlsx --ids-file cas_manager.txt
+```
+
+### Options complètes
+
+```bash
+python run_analysis.py --help
+python evaluate.py --help
 ```
 
 ---
 
-## 8. Composants developpes
-
-### 8.1 Chargeur Excel
-
-Le chargeur :
-
-- parcourt les feuilles du classeur ;
-- cherche les trois colonnes requises ;
-- charge uniquement les informations utiles ;
-- conserve la ligne Excel source ;
-- controle les ID absents ou dupliques ;
-- controle les textes et types absents ;
-- separe les exigences analysables des objets ignores ;
-- produit un diagnostic d'import.
-
-Resultats disponibles :
-
-```python
-result["all_objects"]
-result["requirements"]
-result["invalid_requirements"]
-result["ignored_objects"]
-result["diagnostics"]
-```
-
-### 8.2 Catalogue de regles
-
-Le fichier `rules/rules_en.csv` contient le catalogue de controle qualite.
-
-Colonnes :
+## 4. Structure du projet
 
 ```text
-rule_id
-category
-pattern
-severity
-explanation
-clarification_question
-rewrite_template
-enabled
+.
+|-- run_analysis.py          pipeline complet : import, règles, LLM, rapport
+|-- evaluate.py              mesure précision, rappel, F1 sur un jeu de référence
+|
+|-- src/
+|   |-- config.py            tous les réglages : alias, seuils, gravités
+|   |-- text_utils.py        normalisation, détection de rôle, heuristiques
+|   |-- excel_loader.py      import génerique d'un fichier client
+|   |-- rule_loader.py       chargement et validation du catalogue
+|   |-- rule_engine.py       application des règles, score, risque
+|   |-- llm_analyzer.py      analyse contextuelle Ollama
+|   |-- reporting.py         écriture et mise en forme des rapports
+|
+|-- rules/
+|   |-- rules_en.csv         catalogue de 83 règles
+|
+|-- tests/
+|   |-- make_fixtures.py     génère 6 classeurs de test hétérogènes
+|   |-- conftest.py
+|   |-- test_*.py            120 tests
+|
+|-- data/input/              fichiers à analyser
+|-- data/output/             rapports produits
 ```
 
-Categories principales :
-
-```text
-AMBIGUITY
-NOT_VERIFIABLE
-INCOMPLETE
-UNDEFINED_CONDITION
-UNDEFINED_REFERENCE
-UNDEFINED_QUANTITY
-WEAK_OBLIGATION
-POTENTIALLY_NON_ATOMIC
-MISSING_ACTOR
-MISSING_UNIT_OR_LIMIT
-MISSING_TOLERANCE
-MISSING_VERIFICATION_CRITERIA
-```
-
-Gravites :
-
-```text
-LOW
-MEDIUM
-HIGH
-CRITICAL
-```
-
-Une regle est un signal de revue et non une decision automatique de non-conformite.
-
-### 8.3 Chargeur de regles
-
-`src/rule_loader.py` :
-
-- lit le CSV en UTF-8 ;
-- verifie les colonnes obligatoires ;
-- controle les identifiants dupliques ;
-- controle les niveaux de gravite ;
-- compile les expressions regulieres ;
-- gere les regles actives et desactivees ;
-- fournit des fonctions de recherche par ID, categorie et gravite.
-
-Test :
-
-```powershell
-.\.venv\Scripts\python.exe -m src.rule_loader
-```
-
-### 8.4 Moteur de regles
-
-`src/rule_engine.py` :
-
-- applique les regles aux exigences ;
-- enregistre chaque occurrence ;
-- conserve la preuve textuelle et sa position ;
-- determine la gravite maximale ;
-- calcule un statut qualite ;
-- consolide les explications et questions ;
-- propose un brouillon de risque ;
-- mesure le temps par exigence.
-
-Statuts :
-
-```text
-PRE_ANALYSIS_OK
-REVIEW_REQUIRED
-CLARIFICATION_REQUIRED
-NON_ANALYSABLE
-```
-
-Sorties :
-
-```python
-analysis_result["summary"]
-analysis_result["findings"]
-analysis_result["diagnostics"]
-```
-
-### 8.5 Analyseur LLM
-
-`src/llm_analyzer.py` communique avec Ollama.
-
-Responsabilites actuelles :
-
-- verifier qu'Ollama est accessible ;
-- verifier que `qwen2.5:3b` est installe ;
-- recevoir une exigence et les alertes du moteur ;
-- demander au modele d'evaluer chaque alerte ;
-- produire une sortie JSON ;
-- confirmer ou rejeter les findings ;
-- identifier les informations manquantes ;
-- proposer des questions de clarification ;
-- proposer une reformulation ;
-- proposer un brouillon de risque ;
-- collecter les tokens et temps d'execution ;
-- retourner une erreur exploitable sans casser tout le lot.
-
-Decisions :
-
-```text
-CONFIRMED
-PARTIALLY_CONFIRMED
-FALSE_POSITIVE
-NEEDS_EXPERT_REVIEW
-ERROR
-```
-
-Le calcul de la decision globale a ete deplace vers Python a partir de valeurs `issue_present` produites par le LLM. Cette approche evite certaines incoherences dans lesquelles un finding etait rejete avec une justification confirmant pourtant le probleme.
-
-### 8.6 Pipeline complet
-
-`run_analysis.py` :
-
-- charge le fichier Excel ;
-- charge le catalogue ;
-- execute le moteur ;
-- affiche les diagnostics ;
-- genere un rapport Excel.
-
-L'integration automatique generale du LLM dans ce script reste a finaliser et stabiliser.
-
-### 8.7 Test manager
-
-`test_manager_requirements.py` utilise dix exigences identifiees comme problematiques par le manager :
-
-```text
-PKP-ANNEX1.CUS-72
-PKP-ANNEX1.CUS-198
-PKP-ANNEX1.CUS-3475
-PKP-ANNEX1.CUS-235
-PKP-ANNEX1.CUS-237
-PKP-ANNEX1.CUS-3482
-PKP-ANNEX1.CUS-3489
-PKP-ANNEX1.CUS-314
-PKP-ANNEX1.CUS-562
-PKP-ANNEX1.CUS-609
-```
-
-Ce jeu permet de mesurer le rappel sur des cas positifs. Il ne suffit pas pour mesurer la precision, puisqu'il ne contient pas encore de cas consideres comme correctement rediges.
+Pour ajouter le support d'un nouveau format client, il suffit en
+général d'ajouter un alias dans `src/config.py`. Aucun nom de
+colonne n'est codé en dur ailleurs.
 
 ---
 
-## 9. Commandes d'utilisation
+## 5. Catalogue de règles
 
-### 9.1 Verifier la syntaxe
+`rules/rules_en.csv`, 8 colonnes :
 
-```powershell
-.\.venv\Scripts\python.exe -m py_compile .\src\rule_loader.py
-.\.venv\Scripts\python.exe -m py_compile .\src\rule_engine.py
-.\.venv\Scripts\python.exe -m py_compile .\src\llm_analyzer.py
-.\.venv\Scripts\python.exe -m py_compile .\run_analysis.py
-.\.venv\Scripts\python.exe -m py_compile .\test_manager_requirements.py
+```text
+rule_id, category, pattern, severity, explanation,
+clarification_question, rewrite_template, enabled
 ```
 
-Aucun affichage signifie que la syntaxe est valide.
+Catégories : `AMBIGUITY`, `NOT_VERIFIABLE`, `INCOMPLETE`,
+`UNDEFINED_CONDITION`, `UNDEFINED_REFERENCE`, `UNDEFINED_QUANTITY`,
+`WEAK_OBLIGATION`, `POTENTIALLY_NON_ATOMIC`, `MISSING_ACTOR`,
+`MISSING_UNIT_OR_LIMIT`, `MISSING_TOLERANCE`,
+`MISSING_VERIFICATION_CRITERIA`.
 
-### 9.2 Tester le chargeur Excel
+Gravités : `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
 
-```powershell
-.\.venv\Scripts\python.exe .\load_excel.py `
-  ".\data\input\10_examples_CONCEPT DESIGN.CUS.xlsx"
+Répartition actuelle : 83 règles actives, 34 `HIGH`, 44 `MEDIUM`,
+5 `LOW`, aucune `CRITICAL`.
+
+Le catalogue peut être réparti sur plusieurs fichiers, par exemple
+un socle commun et un fichier par client :
+
+```bash
+python run_analysis.py -i export.xlsx --rules rules/ mon_client/regles.csv
 ```
 
-### 9.3 Tester le catalogue
+Un identifiant défini deux fois est signalé avec le nom des deux
+fichiers concernés.
 
-```powershell
-.\.venv\Scripts\python.exe -m src.rule_loader
+Une règle est un **signal de revue**, jamais une décision de
+non-conformité.
+
+---
+
+## 6. Interprétation du rapport
+
+### Feuille `Analysis_Results`
+
+Une ligne par exigence.
+
+| Colonne | Signification |
+|---|---|
+| `Quality_Status` | `PRE_ANALYSIS_OK`, `REVIEW_RECOMMENDED`, `REVIEW_REQUIRED`, `CLARIFICATION_REQUIRED`, `NOT_ANALYSED` |
+| `Quality_Score` | 0 à 100, pénalisé **une seule fois par règle** |
+| `Issue_Count` | Nombre de règles distinctes déclenchées |
+| `Occurrence_Count` | Nombre total de correspondances |
+| `Evidence` | Passages exacts qui ont déclenché les règles |
+| `Risk_To_Assess` | Un risque projet mérite d'être examiné |
+| `LLM_Decision` | `CONFIRMED`, `PARTIALLY_CONFIRMED`, `FALSE_POSITIVE`, `NEEDS_EXPERT_REVIEW`, `ERROR`, `NOT_RUN` |
+
+`Issue_Count` et `Occurrence_Count` sont distincts à dessein : une
+exigence qui répète dix fois le même mot vague n'a pas dix défauts,
+elle en a un. Le score suit la même logique.
+
+`NOT_RUN` signifie que le modèle n'a pas été consulté. Une absence
+d'avis ne doit jamais être lue comme un avis favorable.
+
+### Autres feuilles
+
+| Feuille | Contenu |
+|---|---|
+| `Rule_Findings` | Une ligne par occurrence, avec preuve et position |
+| `Excluded_Rows` | Toute ligne non analysée, avec son motif |
+| `Diagnostics` | Import, catalogue, moteur, LLM |
+| `Run_Information` | Fichiers, colonnes retenues, modèle, durée |
+| `Rules_Used` | Catalogue effectivement appliqué |
+
+---
+
+## 7. Fiabilité de l'analyse LLM
+
+Quatre mécanismes, dans l'ordre où ils agissent :
+
+**1. Constats dédupliqués avant l'appel.** Les occurrences sont
+regroupées par `rule_id`, avec leurs preuves en liste. Envoyer deux
+fois le même identifiant conduisait le modèle à répondre deux fois,
+ce que le contrôle de cohérence rejetait : toute la réponse était
+perdue. C'était la cause principale des échecs sur les exigences
+longues.
+
+**2. Sortie contrainte par un schéma JSON.** Le schéma est transmis
+à Ollama via `format`, avec les identifiants de règles attendus en
+énumération. Le modèle ne peut structurellement ni tronquer sa
+réponse, ni commenter, ni inventer une règle.
+
+**3. Décision calculée en Python.** La décision globale est déduite
+des valeurs `issue_present`, jamais demandée au modèle. Cela évite
+qu'un constat soit rejeté avec une justification qui, en réalité,
+confirmait le problème.
+
+**4. Une seule reprise.** En cas d'échec, une seconde tentative est
+lancée avec `temperature` à 0, `num_predict` augmenté de 30 % et
+`repeat_penalty` à 1.15. Jamais plus d'une reprise, jamais de
+boucle. La réponse brute est conservée dans le rapport.
+
+### Prompt indépendant du domaine
+
+Le prompt ne contient plus aucun exemple métier. Une version
+précédente citait un cas de temps de réponse, et le modèle
+réutilisait ensuite des notions de délai ou de déclencheur sur des
+exigences sans aucun rapport. Les consignes passent par une grille
+abstraite : acteur, obligation, action, objet, portée, conditions,
+quantification, unités, tolérances, vérification, atomicité,
+références, cohérence.
+
+### Règles de sécurité fonctionnelle
+
+Le modèle ne doit jamais modifier le texte original, inventer une
+valeur, un seuil, une norme, une version, un acteur ou une date,
+transformer une préférence en engagement contractuel, valider une
+reformulation, ouvrir un risque ou communiquer avec le client.
+
+Les valeurs inconnues restent dans des marqueurs descriptifs :
+
+```text
+[MAXIMUM RESPONSE TIME TO BE CONFIRMED]
+[COMPONENTS TO BE DEFINED]
+[ACCEPTANCE CRITERION TO BE DEFINED]
 ```
 
-### 9.4 Tester le moteur
+et non `[VALUE TO BE CONFIRMED]`, trop vague pour être actionnable.
 
-```powershell
-.\.venv\Scripts\python.exe -m src.rule_engine
+---
+
+## 8. Mesurer la performance honnêtement
+
+`evaluate.py` produit des indicateurs séparés, parce qu'ils
+répondent à des questions différentes :
+
+| Indicateur | Question |
+|---|---|
+| `Rule_Engine` | Que trouvent les règles seules ? |
+| `LLM_Business_On_Success` | Que dit le modèle, sur ses réponses exploitables ? |
+| `End_To_End` | Que trouve la chaîne complète ? |
+| `technical_success_rate` | Quelle part des appels aboutit techniquement ? |
+
+Deux règles de méthode appliquées dans le code :
+
+- **Une erreur technique n'est pas une détection.** `ERROR` et
+  `NEEDS_EXPERT_REVIEW` ne sont jamais comptés comme des défauts
+  trouvés. Compter `NEEDS_EXPERT_REVIEW` comme un succès gonflait
+  artificiellement le rappel du modèle.
+- **Sans cas corrects, la précision n'existe pas.** Un jeu de
+  référence uniquement composé de cas problématiques mesure le
+  rappel et rien d'autre. Le rapport affiche alors explicitement
+  « précision non mesurable » au lieu d'un chiffre trompeur.
+
+Jeu de référence cible : **10 cas problématiques et 10 cas
+considérés correctement rédigés**, validés par le métier.
+
+---
+
+## 9. Tests
+
+```bash
+./.venv/bin/python -m pytest
 ```
 
-### 9.5 Tester le LLM seul
+120 tests, sans aucun appel réseau : le LLM est testé via un client
+factice.
 
-```powershell
-.\.venv\Scripts\python.exe -m src.llm_analyzer
-```
+Les classeurs de test couvrent six présentations du même contenu
+(DOORS, colonnes renommées avec en-tête décalé, sans identifiant ni
+type, intitulé séparé, CSV à point-virgule, français). Le pipeline
+doit produire le même résultat analytique pour les quatre formats
+équivalents : c'est le test qui garantit la généricité.
 
-### 9.6 Analyser l'export complet avec les regles
+Pour régénérer les fixtures :
 
-```powershell
-.\.venv\Scripts\python.exe .\run_analysis.py `
-  --input ".\data\input\00 - PKP-A1_CONCEPT DESIGN.CUS (2026-09-29 18 26 32).xlsx" `
-  --rules ".\rules\rules_en.csv" `
-  --output ".\data\output\PKP_quality_analysis.xlsx" `
-  --sample-size 20
-```
-
-### 9.7 Tester les dix cas sans LLM
-
-```powershell
-.\.venv\Scripts\python.exe .\test_manager_requirements.py `
-  --input ".\data\input\10_examples_CONCEPT DESIGN.CUS.xlsx" `
-  --rules ".\rules\rules_en.csv" `
-  --output ".\data\output\manager_test_rules_only.xlsx" `
-  --skip-llm
-```
-
-### 9.8 Tester les dix cas avec Qwen
-
-```powershell
-.\.venv\Scripts\python.exe .\test_manager_requirements.py `
-  --input ".\data\input\10_examples_CONCEPT DESIGN.CUS.xlsx" `
-  --rules ".\rules\rules_en.csv" `
-  --output ".\data\output\manager_test_qwen.xlsx" `
-  --model "qwen2.5:3b"
+```bash
+./.venv/bin/python -m tests.make_fixtures
 ```
 
 ---
 
-## 10. Rapport Excel
+## 10. Performance observée
 
-Le rapport de test contient notamment :
+### Moteur de règles
 
-### `Manager_Test_Results`
+2 000 lignes désordonnées, dont des textes très longs, des lignes
+vides, des types inconnus et des identifiants dupliqués :
 
-Une ligne par exigence avec :
+```text
+Lecture + analyse + rapport Excel : environ 1,5 s
+Analyse seule                     : 0,11 s, soit 0,09 ms par exigence
+```
 
-- texte original ;
-- statut des regles ;
-- nombre d'anomalies ;
-- categories ;
-- preuves ;
-- decision LLM ;
-- findings confirmes et rejetes ;
-- informations manquantes ;
-- questions ;
-- reformulation ;
-- risque ;
-- temps et tokens ;
-- erreur technique eventuelle.
+Le moteur peut donc traiter l'intégralité d'un export sans
+sélection préalable.
 
-### `Rule_Findings`
+### LLM local
 
-Une ligne par anomalie deterministe.
+Avec `qwen2.5:3b`, environ 11 à 16 tokens par seconde sur machine
+de bureau, soit **26 à 53 secondes par exigence**. Estimation :
 
-### `Run_Information`
+```text
+100 exigences    : environ 1 h 15
+1 000 exigences  : environ 12 h 30
+```
 
-Synthese de l'execution :
-
-- fichiers utilises ;
-- modele ;
-- cas trouves ;
-- rappel des regles ;
-- couverture technique LLM ;
-- temps total ;
-- date.
+Le LLM n'est donc pas utilisable sur un export complet. C'est la
+raison d'être de `--llm-limit` et du classement par priorité : les
+règles filtrent, le modèle approfondit.
 
 ---
 
-## 11. Resultats obtenus
+## 11. État actuel
 
-Premier test complet sur les dix exigences manager :
-
-```text
-Exigences trouvees       : 10/10
-Detectees par les regles : 8/10
-Rappel moteur de regles  : 80 %
-Signalees par le LLM     : 6/10
-Temps total              : 449,33 secondes
-```
-
-Interpretation correcte du resultat LLM :
-
-```text
-6 appels avec reponse exploitable
-4 erreurs techniques ou JSON incomplets
-0 rejet metier confirme dans les reponses exploitables
-```
-
-Les quatre erreurs ne doivent pas etre automatiquement comptees comme des faux negatifs metier. Les statistiques futures doivent distinguer :
-
-```text
-Rule_Engine_Recall
-LLM_Technical_Success_Rate
-LLM_Confirmation_Rate_On_Success
-End_To_End_Recall
-```
-
-Performance observee sur le cas de test simple :
-
-```text
-Modele              : qwen2.5:3b
-Vitesse              : environ 11 a 16 tokens/s
-Temps par exigence   : environ 26 a 53 secondes selon le prompt
-```
-
-Le lot de dix exigences a pris environ 7 minutes et 29 secondes.
+| Composant | État |
+|---|---|
+| Import générique multi-format | Fonctionnel, testé sur 6 formats |
+| Détection colonnes, feuille, en-tête | Fonctionnelle, surchargeable |
+| Catalogue de règles | Fonctionnel, 83 règles, à enrichir |
+| Catalogue multi-fichiers | Fonctionnel |
+| Moteur déterministe | Fonctionnel |
+| Score et statuts qualité | Fonctionnels, seuils réglables |
+| Analyse LLM intégrée au pipeline | Fonctionnelle |
+| Sortie JSON contrainte par schéma | Fonctionnelle |
+| Reprise unique | Fonctionnelle |
+| Évaluation précision / rappel / F1 | Fonctionnelle |
+| Rapport Excel | Fonctionnel |
+| Tests automatisés | 120 tests |
+| Jeu de référence avec cas négatifs | **À constituer avec le métier** |
+| Interface de validation humaine | À faire |
+| Déploiement partagé | À faire après validation métier |
+| RAG | Hors périmètre |
 
 ---
 
 ## 12. Limites connues
 
-### 12.1 Jeu de reference uniquement positif
+**Couverture sémantique.** Les règles sont lexicales. Une exigence
+demandant de réduire un phénomène sans définir le niveau de
+réduction ni la méthode de vérification ne contient aucun mot
+suspect. C'est précisément ce que le mode `FULL_CONTEXT_REVIEW` du
+LLM doit couvrir, et ce qui reste à mesurer.
 
-Les dix exigences du manager sont toutes considerees problematiques. Le jeu mesure le rappel, mais pas la precision ni les faux positifs.
+**Précision non mesurée sur données réelles.** Sur les classeurs de
+test, 100 % de précision et de rappel. Mais ces fixtures ont été
+construites pour l'outil. Le chiffre qui compte viendra d'un jeu de
+référence constitué par le métier, avec des cas corrects.
 
-### 12.2 Couverture des regles
+**Catalogue conservateur.** Le catalogue ne produit aucune alerte
+sur des formulations pourtant discutables comme « the relevant
+clauses » ou « the applicable curve ». Il privilégie la précision
+au rappel. C'est un choix défendable en revue client, mais il doit
+être assumé.
 
-Certaines anomalies sont semantiques et difficiles a detecter avec un mot-cle. Exemple : une exigence demandant de reduire un phenomene sans definir le niveau de reduction ni les conditions de verification.
+**Langue.** Les règles sont en anglais. Un export en français est
+analysé et un avertissement est émis, mais presque rien ne sera
+détecté. Un catalogue français serait un fichier CSV
+supplémentaire, chargeable via `--rules`.
 
-### 12.3 Regles manquantes identifiees
-
-Deux formulations ont ete identifiees comme non couvertes dans le catalogue initial :
-
-```text
-maximally modular
-as quickly as possible
-```
-
-Elles doivent etre ajoutees au catalogue, apres validation metier.
-
-### 12.4 Prompt trop influence par un exemple
-
-Une version du prompt utilisait l'exemple `respond rapidly`. Le modele reutilisait parfois a tort des notions de temps de reponse ou de trigger pour des exigences sans rapport. Le prompt doit rester general et independant du domaine.
-
-### 12.5 JSON incomplet
-
-Sur les exigences longues, le modele peut produire :
-
-```text
-Unterminated string
-token repeat limit reached
-```
-
-Causes probables :
-
-- limite de sortie trop basse ;
-- reponse trop longue ;
-- repetition du modele ;
-- exigence tres longue avec plusieurs findings.
-
-### 12.6 Temps de traitement
-
-Le LLM est trop lent pour analyser systematiquement environ 1 000 exigences sur la machine actuelle.
-
-Estimation lineaire observee :
-
-```text
-100 exigences  : environ 1 h 15
-1 000 exigences: environ 12 h 30
-```
-
-L'architecture cible doit donc utiliser les regles pour filtrer les cas prioritaires avant le LLM.
-
-### 12.7 Absence de validation humaine dans une interface
-
-Les decisions humaines ne sont pas encore gerees dans une interface dediee. Elles doivent etre ajoutees avant tout usage operationnel.
+**Validation humaine hors outil.** Les décisions de l'analyste ne
+sont pas encore saisies dans une interface. C'est le prérequis
+avant tout usage opérationnel.
 
 ---
 
-## 13. Regles de securite fonctionnelle
+## 13. Suite du travail
 
-Le LLM ne doit jamais :
+**Priorité 1 — faire valider les règles par le métier.** Le
+catalogue est le cœur de l'outil et n'a pas encore été revu règle
+par règle avec un responsable exigences.
 
-- modifier le texte original ;
-- inventer une valeur ou un seuil ;
-- inventer une norme ou une version ;
-- inventer un acteur ;
-- transformer une preference en engagement contractuel ;
-- valider automatiquement une reformulation ;
-- ouvrir automatiquement un risque ;
-- communiquer automatiquement avec le client.
+**Priorité 2 — constituer le jeu de référence.** Demander 10 cas
+problématiques et 10 cas corrects, puis lancer `evaluate.py`. Sans
+cela, aucun chiffre de précision n'est défendable.
 
-Les valeurs inconnues doivent utiliser des placeholders descriptifs :
+**Priorité 3 — mesurer le LLM sur ce jeu.** Comparer
+`Rule_Engine`, `LLM_Business_On_Success` et `End_To_End`, et
+vérifier sur les reformulations : aucune valeur inventée, aucun
+changement de sens contractuel, marqueurs respectés.
 
-```text
-[MAXIMUM RESPONSE TIME TO BE CONFIRMED]
-[COMPONENTS TO BE DEFINED]
-[APPLICABLE CONDITIONS TO BE CONFIRMED]
-[ACCEPTANCE CRITERION TO BE DEFINED]
-```
+**Priorité 4 — interface de validation humaine.** Dépôt du
+fichier, aperçu, lancement, filtres, acceptation ou rejet par
+exigence, export. C'est ce qui transforme le prototype en outil.
 
-Eviter :
+**Priorité 5 — enrichir le catalogue** avec les formulations
+remontées en revue, et envisager un catalogue par domaine.
 
-```text
-[VALUE TO BE CONFIRMED]
-```
-
-lorsqu'un placeholder plus precis est possible.
+**Priorité 6 — déploiement**, après validation métier seulement :
+interface web, API, moteur de règles et Ollama, base de données,
+traçabilité des décisions humaines.
 
 ---
 
-## 14. Ce qui reste a faire
+## 14. Dépannage
 
-### Priorite 1 - Stabiliser la version actuelle
+**`Aucune colonne de texte d'exigence n'a été reconnue`**
+Le message liste les colonnes disponibles. Utilise
+`--text-column "<nom exact>"`.
 
-- conserver une sauvegarde des versions fonctionnelles ;
-- supprimer les caracteres HTML parasites comme `-&gt;` ;
-- compiler tous les scripts avant execution ;
-- ajouter les deux formulations manquantes au CSV ;
-- relancer le test des regles uniquement ;
-- confirmer le passage potentiel de 8/10 a 9/10.
+**La mauvaise feuille est analysée**
+`--sheet "<nom de la feuille>"`.
 
-### Priorite 2 - Generaliser le prompt LLM
+**La mauvaise ligne d'en-tête est retenue**
+`--header-row 4` (numérotation Excel, la première ligne vaut 1).
 
-- retirer les exemples specifiques au temps de reponse ;
-- utiliser une grille generique : acteur, obligation, action, objet, scope, conditions, quantification, tolerance, verification, atomicite et references ;
-- demander une revue contextuelle complete apres la validation des findings ;
-- eviter d'ajouter des criteres non pertinents ;
-- conserver le niveau d'abstraction initial.
+**Trop de lignes écartées**
+Consulte la feuille `Excluded_Rows` du rapport : chaque ligne porte
+son motif. Au besoin, `--include-types`, `--exclude-types` ou
+`--keep-headings`.
 
-### Priorite 3 - Fiabiliser le JSON
-
-- augmenter `num_predict` de maniere controlee ;
-- ajouter `repeat_penalty` ;
-- limiter le nombre et la longueur des champs ;
-- ajouter une seule reprise automatique ;
-- ne jamais boucler indefiniment ;
-- conserver la reponse brute pour diagnostic.
-
-Parametres candidats :
-
-```python
-num_ctx = 4096
-num_predict = 700
-temperature = 0.1
-repeat_penalty = 1.1
-seed = 42
-keep_alive = "30m"
-```
-
-En reprise :
-
-```python
-temperature = 0.0
-num_predict = 850
-repeat_penalty = 1.15
-```
-
-### Priorite 4 - Corriger les statistiques
-
-Ajouter :
-
-```text
-nombre d'appels LLM
-nombre de succes techniques
-nombre d'erreurs techniques
-nombre de decisions CONFIRMED
-nombre de decisions PARTIALLY_CONFIRMED
-nombre de FALSE_POSITIVE
-taux de succes technique
-taux de confirmation sur succes
-rappel de bout en bout
-```
-
-### Priorite 5 - Ajouter des cas negatifs
-
-Demander au manager au moins dix exigences considerees correctement redigees.
-
-Jeu cible :
-
-```text
-10 cas problematiques
-10 cas corrects
-```
-
-Puis calculer :
-
-```text
-precision
-rappel
-F1-score
-faux positifs
-faux negatifs
-```
-
-### Priorite 6 - Elargir le jeu de validation
-
-Ajouter des exigences issues de plusieurs domaines :
-
-- logiciel ;
-- cybersécurite ;
-- performance ;
-- maintenance ;
-- documentation ;
-- mecanique ;
-- securite ;
-- contractuel.
-
-### Priorite 7 - Ajouter l'interface Streamlit
-
-Fonctions attendues :
-
-- depot d'un fichier ;
-- apercu ;
-- diagnostic ;
-- lancement des regles ;
-- selection des exigences pour analyse LLM ;
-- progression ;
-- filtres ;
-- comparaison regles/LLM ;
-- acceptation, modification ou rejet ;
-- telechargement du rapport.
-
-### Priorite 8 - Deploiement partage
-
-Apres validation du PoC :
-
-```text
-Interface Web
-    |
-FastAPI
-    |
-Moteur de regles + Ollama
-    |
-PostgreSQL
-    |
-Validation humaine
-```
-
-Pour 20 utilisateurs, une VM interne peut suffire. Pour une cible de 120 personnes, un serveur LLM dedie, une file d'attente, une authentification et une supervision seront necessaires.
-
-### Priorite 9 - RAG, plus tard
-
-Le RAG n'est pas necessaire pour les regles lexicales. Il sera utile pour fournir :
-
-- glossaire client ;
-- regles redactionnelles ;
-- standards applicables ;
-- exemples approuves ;
-- criteres de verification ;
-- contexte projet.
-
-Le modele `bge-m3` pourra alors servir a produire les embeddings.
-
----
-
-## 15. Strategie de validation recommandee
-
-Pour chaque exigence, enregistrer :
-
-```text
-Expected_Flag
-Expected_Categories
-Rule_Engine_Flag
-Triggered_Rules
-LLM_Technical_Status
-LLM_Decision
-LLM_Additional_Issues
-Useful_Questions
-Faithful_Rewrite
-Invented_Value
-Risk_Relevant
-Human_Decision
-Human_Comment
-```
-
-Criteres eliminatoires pour un modele :
-
-- valeurs inventees ;
-- changement du sens contractuel ;
-- JSON souvent invalide ;
-- non-respect des placeholders ;
-- reformulations hors contexte ;
-- risque presente comme valide ;
-- confirmation systematique de toutes les alertes.
-
----
-
-## 16. Depannage
-
-### `ModuleNotFoundError: No module named 'ollama'`
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install ollama
-```
-
-### Scripts PowerShell bloques
-
-L'activation du venv n'est pas obligatoire :
-
-```powershell
-.\.venv\Scripts\python.exe script.py
-```
-
-### `FileNotFoundError`
-
-Verifier :
-
-```powershell
-Get-ChildItem ".\data\input" -File
-```
-
-Utiliser le chemin exact du fichier.
-
-### Caracteres HTML dans Python
-
-Incorrect :
-
-```text
--&gt;
-&lt;
-&gt;
-<br>
-```
-
-Correct :
-
-```text
-->
-<
->
-```
-
-Rechercher :
-
-```powershell
-Select-String `
-  -Path ".\src\*.py" `
-  -Pattern "&gt;|&lt;|<br>|<em>|</em>"
-```
-
-### `return outside function` ou `unexpected unindent`
-
-Verifier l'indentation :
-
-```text
-classe   : 0 espace
-methode  : 4 espaces
-contenu  : 8 espaces
-```
-
-### Rapport Excel impossible a ecrire
-
-Fermer le fichier dans Excel puis relancer.
-
-### Ollama ne repond pas
-
-```powershell
+**`Le modèle ... n'est pas installé`**
+```bash
+ollama pull qwen2.5:3b
 ollama list
 ```
 
-Puis :
-
-```powershell
+**`Impossible de contacter Ollama`**
+```bash
 ollama serve
 ```
+Ne pas démarrer un second serveur si le port 11434 est déjà pris.
 
-Ne pas demarrer un second serveur si le port 11434 est deja utilise.
+**`Impossible d'écrire le rapport`**
+Le fichier est ouvert dans Excel. Ferme-le puis relance.
 
----
-
-## 17. Etat actuel du PoC
-
-| Composant | Etat |
-|---|---|
-| Chargement Excel | Fonctionnel |
-| Detection des colonnes | Fonctionnelle |
-| Filtrage `ObjectType` | Fonctionnel |
-| Catalogue de regles | Fonctionnel, a enrichir |
-| Chargeur de regles | Fonctionnel |
-| Moteur deterministe | Fonctionnel |
-| Export Excel | Fonctionnel |
-| Connexion Ollama | Fonctionnelle |
-| Qwen2.5:3b | Fonctionnel |
-| Sortie JSON | Fonctionnelle mais encore instable sur certains cas longs |
-| Test manager | Fonctionnel |
-| Statistiques LLM | A corriger et separer |
-| Prompt general multi-domaine | A finaliser |
-| Reprise automatique | A implementer proprement |
-| Interface Streamlit | A faire |
-| FastAPI partagee | Test technique realise, integration a faire |
-| Base de donnees | A faire apres validation du PoC |
-| RAG | Hors PoC 1, evolution future |
-| Deploiement serveur | A faire apres validation metier |
-
----
-
-## 18. Prochaine sequence de travail
-
-Ordre recommande :
-
-```text
-1. Geler une copie de la version fonctionnelle
-2. Verifier la syntaxe de tous les fichiers
-3. Ajouter les deux regles manquantes
-4. Relancer les regles seules
-5. Generaliser le prompt sans exemple specifique
-6. Limiter la longueur des sorties
-7. Ajouter une reprise unique
-8. Corriger les statistiques LLM
-9. Relancer les dix cas manager
-10. Faire valider les resultats par le manager
-11. Ajouter dix cas negatifs
-12. Calculer precision, rappel et F1
-13. Creer l'interface Streamlit
-14. Integrer le LLM au pipeline general
-15. Preparer le deploiement sur une VM interne
-```
-
----
-
-## 19. Conclusion
-
-Le PoC a demontre la faisabilite technique de la chaine suivante :
-
-```text
-Excel DOORS
--> filtrage
--> regles explicites
--> analyse LLM locale
--> rapport Excel
-```
-
-Les resultats initiaux montrent :
-
-- un moteur de regles rapide et deja utile ;
-- un rappel initial de 80 % sur dix cas positifs ;
-- une capacite du LLM a contextualiser les alertes ;
-- une necessite de fiabiliser les sorties JSON ;
-- une necessite de generaliser le prompt ;
-- un besoin de validation humaine et de cas negatifs avant conclusion.
-
-La priorite n'est pas encore le deploiement a grande echelle. La priorite est de stabiliser le comportement, mesurer les faux positifs et faire valider les resultats par les responsables metier.
+**`La règle 'X' est définie dans a.csv et dans b.csv`**
+Deux fichiers du catalogue déclarent le même identifiant. Supprime
+le doublon, ou utilise `--non-strict-rules` pour ignorer les règles
+en conflit.

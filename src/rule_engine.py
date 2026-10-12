@@ -1,75 +1,66 @@
 # ============================================================
-# Moteur d'analyse des exigences
+# Moteur de règles déterministe
+# ============================================================
+#
+# Le moteur détecte et prouve. Il ne décide pas.
+#
+# Il reçoit un tableau déjà normalisé par le chargeur et
+# applique le catalogue de règles. Il ne connaît ni le nom des
+# colonnes du client, ni son vocabulaire de types : ce travail
+# est fait en amont.
+#
 # ============================================================
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any
 
 import pandas as pd
 
-try:
-    from src.rule_loader import Rule
-except ModuleNotFoundError:
-    from rule_loader import Rule
+from src import config
+from src.config import (
+    CANONICAL_ID,
+    CANONICAL_TEXT,
+    CANONICAL_TYPE,
+    SOURCE_ROW,
+    SOURCE_SHEET,
+    EngineSettings,
+)
+from src.rule_loader import Rule
+from src.text_utils import clean_value
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
-ID_COLUMN = "ID"
-TEXT_COLUMN = "Object Heading and Object Text"
-TYPE_COLUMN = "ObjectType"
-
-ANALYSABLE_OBJECT_TYPES = {
-    "Technical Req",
-    "Non-Technical Req",
-}
-
-SEVERITY_RANK = {
-    "LOW": 1,
-    "MEDIUM": 2,
-    "HIGH": 3,
-    "CRITICAL": 4,
-}
-
-STATUS_RANK = {
-    "PRE_ANALYSIS_OK": 1,
-    "REVIEW_REQUIRED": 2,
-    "CLARIFICATION_REQUIRED": 3,
-    "NON_ANALYSABLE": 4,
-}
 
 FINDING_COLUMNS = [
-    "requirement_id",
-    "original_text",
-    "object_type",
-    "source_excel_row",
-    "rule_id",
-    "category",
-    "severity",
-    "evidence",
-    "start_position",
-    "end_position",
-    "explanation",
-    "clarification_question",
-    "rewrite_template",
+    "Requirement_ID",
+    "Rule_ID",
+    "Category",
+    "Severity",
+    "Evidence",
+    "Start_Position",
+    "End_Position",
+    "Occurrence_Index",
+    "Explanation",
+    "Clarification_Question",
+    "Rewrite_Template",
+    "Source_Excel_Row",
 ]
 
 SUMMARY_COLUMNS = [
-    "ID",
-    "Object Heading and Object Text",
-    "ObjectType",
-    "Source_Excel_Row",
+    CANONICAL_ID,
+    CANONICAL_TEXT,
+    CANONICAL_TYPE,
+    SOURCE_ROW,
+    SOURCE_SHEET,
     "Quality_Status",
+    "Quality_Score",
     "Issue_Count",
+    "Occurrence_Count",
+    "Highest_Severity",
     "Issue_Categories",
     "Triggered_Rules",
     "Evidence",
-    "Highest_Severity",
     "Explanations",
     "Clarification_Questions",
     "Proposed_Rewrites",
@@ -85,112 +76,180 @@ SUMMARY_COLUMNS = [
 
 @dataclass(frozen=True)
 class Finding:
-    """Représente une anomalie détectée sur une exigence."""
+    """Une occurrence de règle détectée dans une exigence."""
 
     requirement_id: str
-    original_text: str
-    object_type: str
-    source_excel_row: int | None
     rule_id: str
     category: str
     severity: str
     evidence: str
     start_position: int
     end_position: int
+    occurrence_index: int
     explanation: str
     clarification_question: str
     rewrite_template: str
+    source_excel_row: int | None
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convertit l'anomalie en dictionnaire exportable."""
+    def to_row(self) -> dict[str, Any]:
+        """Convertit l'anomalie en ligne de rapport."""
 
-        return asdict(self)
+        values = asdict(self)
+
+        return {
+            "Requirement_ID": values["requirement_id"],
+            "Rule_ID": values["rule_id"],
+            "Category": values["category"],
+            "Severity": values["severity"],
+            "Evidence": values["evidence"],
+            "Start_Position": values["start_position"],
+            "End_Position": values["end_position"],
+            "Occurrence_Index": values["occurrence_index"],
+            "Explanation": values["explanation"],
+            "Clarification_Question": values[
+                "clarification_question"
+            ],
+            "Rewrite_Template": values["rewrite_template"],
+            "Source_Excel_Row": values["source_excel_row"],
+        }
 
 
 # ============================================================
-# Fonctions utilitaires
+# Utilitaires
 # ============================================================
 
-def normalize_value(value: Any) -> str:
-    """Convertit une valeur en texte nettoyé."""
-
-    if value is None:
-        return ""
-
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-
-    return str(value).strip()
-
-
-def unique_preserve_order(values: list[str]) -> list[str]:
-    """Supprime les doublons en conservant l'ordre initial."""
+def unique_preserve_order(values: list[Any]) -> list[str]:
+    """Supprime les doublons en conservant l'ordre d'apparition."""
 
     seen: set[str] = set()
     result: list[str] = []
 
     for value in values:
-        cleaned_value = normalize_value(value)
+        cleaned = clean_value(value)
 
-        if cleaned_value and cleaned_value not in seen:
-            seen.add(cleaned_value)
-            result.append(cleaned_value)
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
 
     return result
 
 
-def join_unique(values: list[str], separator: str = " | ") -> str:
-    """Assemble des valeurs uniques dans une seule chaîne."""
+def join_unique(values: list[Any], separator: str = " | ") -> str:
+    """Assemble des valeurs uniques en une chaîne lisible."""
 
     return separator.join(unique_preserve_order(values))
 
 
+def severity_rank(severity: str) -> int:
+    """Retourne le rang numérique d'une gravité."""
+
+    return config.SEVERITY_RANK.get(str(severity).upper(), 0)
+
+
 def get_highest_severity(findings: list[Finding]) -> str:
-    """Retourne la gravité la plus élevée parmi les anomalies."""
+    """Retourne la gravité la plus élevée, ou NONE."""
 
     if not findings:
         return "NONE"
 
     return max(
         (finding.severity for finding in findings),
-        key=lambda severity: SEVERITY_RANK.get(severity, 0),
+        key=severity_rank,
     )
 
 
-def determine_quality_status(findings: list[Finding]) -> str:
-    """Calcule le statut qualité à partir des anomalies détectées."""
+def distinct_rule_ids(findings: list[Finding]) -> list[str]:
+    """Liste les règles déclenchées, sans répétition."""
+
+    return unique_preserve_order(
+        [finding.rule_id for finding in findings]
+    )
+
+
+# ============================================================
+# Score, statut et risque
+# ============================================================
+
+def compute_quality_score(findings: list[Finding]) -> int:
+    """
+    Calcule un score de 0 à 100.
+
+    Le score est pénalisé une seule fois par règle déclenchée.
+    Une exigence qui répète dix fois le même mot vague n'est
+    pas dix fois plus mauvaise qu'une exigence qui le dit une
+    fois : seule la nature du défaut compte.
+    """
 
     if not findings:
-        return "PRE_ANALYSIS_OK"
+        return 100
 
-    highest_severity = get_highest_severity(findings)
+    severity_by_rule: dict[str, str] = {}
 
-    if highest_severity in {"HIGH", "CRITICAL"}:
-        return "CLARIFICATION_REQUIRED"
+    for finding in findings:
+        current = severity_by_rule.get(finding.rule_id)
 
-    return "REVIEW_REQUIRED"
+        if current is None or severity_rank(
+            finding.severity
+        ) > severity_rank(current):
+            severity_by_rule[finding.rule_id] = finding.severity
+
+    penalty = sum(
+        config.SEVERITY_WEIGHT.get(severity, 0)
+        for severity in severity_by_rule.values()
+    )
+
+    return max(0, 100 - penalty)
 
 
-def should_assess_risk(findings: list[Finding]) -> bool:
-    """Indique si un risque doit être évalué par un humain."""
+def determine_quality_status(
+    findings: list[Finding],
+    settings: EngineSettings,
+) -> str:
+    """Déduit le statut qualité de la gravité la plus élevée."""
 
-    risk_categories = {
-        "NOT_VERIFIABLE",
-        "INCOMPLETE",
-        "UNDEFINED_CONDITION",
-        "UNDEFINED_REFERENCE",
-        "MISSING_UNIT_OR_LIMIT",
-        "MISSING_TOLERANCE",
-        "MISSING_VERIFICATION_CRITERIA",
+    if not findings:
+        return config.STATUS_PRE_ANALYSIS_OK
+
+    highest = get_highest_severity(findings)
+
+    return settings.severity_to_status.get(
+        highest,
+        config.STATUS_REVIEW_REQUIRED,
+    )
+
+
+def should_assess_risk(
+    findings: list[Finding],
+    settings: EngineSettings,
+) -> bool:
+    """
+    Indique si un brouillon de risque mérite d'être proposé.
+
+    Deux conditions suffisent, mais aucune n'est automatique :
+    une gravité élevée, ou plusieurs catégories sensibles
+    touchées en même temps. Proposer un risque pour chaque
+    alerte reviendrait à n'en signaler aucun.
+    """
+
+    if not findings:
+        return False
+
+    highest_rank = severity_rank(get_highest_severity(findings))
+
+    if highest_rank >= severity_rank(
+        settings.risk_minimum_severity
+    ):
+        return True
+
+    touched_risk_categories = {
+        finding.category
+        for finding in findings
+        if finding.category in config.RISK_RELEVANT_CATEGORIES
     }
 
-    return any(
-        finding.severity in {"HIGH", "CRITICAL"}
-        or finding.category in risk_categories
-        for finding in findings
+    return (
+        len(touched_risk_categories)
+        >= settings.risk_minimum_category_count
     )
 
 
@@ -198,9 +257,15 @@ def build_risk_draft(
     requirement_id: str,
     findings: list[Finding],
 ) -> str:
-    """Construit un brouillon de risque sans inventer de valeur."""
+    """
+    Construit un brouillon de risque factuel.
 
-    if not findings or not should_assess_risk(findings):
+    Aucune valeur, aucun seuil et aucune conséquence chiffrée
+    n'est inventé : le texte ne reprend que les catégories
+    détectées et les preuves relevées.
+    """
+
+    if not findings:
         return ""
 
     categories = join_unique(
@@ -214,50 +279,29 @@ def build_risk_draft(
     )
 
     return (
-        f"Title: Requirement quality risk for {requirement_id}\n"
-        f"Cause: The requirement contains potential quality issues "
+        f"Title: Requirement quality risk on {requirement_id}\n"
+        "Cause: The requirement shows potential quality issues "
         f"in the following categories: {categories}. "
         f"Detected evidence: {evidence}.\n"
-        "Risk event: The customer and the project team may interpret "
-        "or verify the requirement differently.\n"
+        "Risk event: The customer and the project team may "
+        "interpret or verify the requirement differently.\n"
         "Potential consequence: Rework, acceptance dispute, cost "
-        "increase, or schedule delay.\n"
+        "increase or schedule delay.\n"
         "Status: DRAFT - HUMAN VALIDATION REQUIRED"
     )
-
-
-def validate_requirement_columns(dataframe: pd.DataFrame) -> None:
-    """Vérifie la présence des trois colonnes nécessaires."""
-
-    required_columns = {
-        ID_COLUMN,
-        TEXT_COLUMN,
-        TYPE_COLUMN,
-    }
-
-    missing_columns = sorted(
-        required_columns.difference(dataframe.columns)
-    )
-
-    if missing_columns:
-        raise ValueError(
-            "Colonnes obligatoires absentes du DataFrame : "
-            + ", ".join(missing_columns)
-        )
 
 
 # ============================================================
 # Analyse d'une exigence
 # ============================================================
 
-def analyse_text_with_rules(
+def analyse_text(
     requirement_id: str,
-    original_text: str,
-    object_type: str,
-    source_excel_row: int | None,
+    text: str,
     rules: list[Rule],
+    source_excel_row: int | None,
 ) -> list[Finding]:
-    """Applique toutes les règles actives au texte d'une exigence."""
+    """Applique toutes les règles actives à un texte."""
 
     findings: list[Finding] = []
 
@@ -265,101 +309,87 @@ def analyse_text_with_rules(
         if not rule.enabled:
             continue
 
-        matches = rule.find_matches(original_text)
-
-        for match in matches:
+        for occurrence_index, match in enumerate(
+            rule.find_matches(text),
+            start=1,
+        ):
             findings.append(
                 Finding(
                     requirement_id=requirement_id,
-                    original_text=original_text,
-                    object_type=object_type,
-                    source_excel_row=source_excel_row,
                     rule_id=rule.rule_id,
                     category=rule.category,
                     severity=rule.severity,
                     evidence=match["evidence"],
                     start_position=match["start_position"],
                     end_position=match["end_position"],
+                    occurrence_index=occurrence_index,
                     explanation=rule.explanation,
-                    clarification_question=rule.clarification_question,
+                    clarification_question=(
+                        rule.clarification_question
+                    ),
                     rewrite_template=rule.rewrite_template,
+                    source_excel_row=source_excel_row,
                 )
             )
 
     return findings
 
 
-def analyse_requirement_row(
+def analyse_row(
     row: pd.Series,
     rules: list[Rule],
+    settings: EngineSettings,
 ) -> tuple[dict[str, Any], list[Finding]]:
     """Analyse une ligne et retourne son résumé et ses anomalies."""
 
     started_at = perf_counter()
 
-    requirement_id = normalize_value(row.get(ID_COLUMN))
-    original_text = normalize_value(row.get(TEXT_COLUMN))
-    object_type = normalize_value(row.get(TYPE_COLUMN))
+    requirement_id = clean_value(row.get(CANONICAL_ID))
+    text = clean_value(row.get(CANONICAL_TEXT))
+    object_type = clean_value(row.get(CANONICAL_TYPE))
 
-    source_excel_row_value = row.get("Source_Excel_Row")
-    source_excel_row: int | None = None
+    source_excel_row = row.get(SOURCE_ROW)
 
-    if source_excel_row_value is not None:
-        try:
-            if not pd.isna(source_excel_row_value):
-                source_excel_row = int(source_excel_row_value)
-        except (TypeError, ValueError):
-            source_excel_row = None
-
-    non_analysable_reasons: list[str] = []
-
-    if not requirement_id:
-        non_analysable_reasons.append("Missing ID")
-
-    if not original_text:
-        non_analysable_reasons.append("Missing requirement text")
-
-    if not object_type:
-        non_analysable_reasons.append("Missing ObjectType")
-
-    findings: list[Finding] = []
-
-    if non_analysable_reasons:
-        quality_status = "NON_ANALYSABLE"
-    elif object_type not in ANALYSABLE_OBJECT_TYPES:
-        quality_status = "NON_ANALYSABLE"
-        non_analysable_reasons.append(
-            f"Unsupported ObjectType: {object_type}"
+    try:
+        source_excel_row = (
+            int(source_excel_row)
+            if source_excel_row is not None
+            and not pd.isna(source_excel_row)
+            else None
         )
+    except (TypeError, ValueError):
+        source_excel_row = None
+
+    if not text:
+        findings: list[Finding] = []
+        quality_status = config.STATUS_NOT_ANALYSED
     else:
-        findings = analyse_text_with_rules(
+        findings = analyse_text(
             requirement_id=requirement_id,
-            original_text=original_text,
-            object_type=object_type,
-            source_excel_row=source_excel_row,
+            text=text,
             rules=rules,
+            source_excel_row=source_excel_row,
         )
-        quality_status = determine_quality_status(findings)
-
-    highest_severity = get_highest_severity(findings)
-    risk_to_assess = should_assess_risk(findings)
-
-    if non_analysable_reasons:
-        explanations = " | ".join(non_analysable_reasons)
-    else:
-        explanations = join_unique(
-            [finding.explanation for finding in findings]
+        quality_status = determine_quality_status(
+            findings,
+            settings,
         )
 
-    elapsed_ms = round((perf_counter() - started_at) * 1000, 3)
+    risk_to_assess = should_assess_risk(findings, settings)
 
     summary = {
-        "ID": requirement_id,
-        "Object Heading and Object Text": original_text,
-        "ObjectType": object_type,
-        "Source_Excel_Row": source_excel_row,
+        CANONICAL_ID: requirement_id,
+        CANONICAL_TEXT: text,
+        CANONICAL_TYPE: object_type,
+        SOURCE_ROW: source_excel_row,
+        SOURCE_SHEET: clean_value(row.get(SOURCE_SHEET)),
         "Quality_Status": quality_status,
-        "Issue_Count": len(findings),
+        "Quality_Score": compute_quality_score(findings),
+        # Nombre de règles distinctes, et non d'occurrences :
+        # c'est la mesure qui reflète le nombre de défauts.
+        "Issue_Count": len(distinct_rule_ids(findings)),
+        "Occurrence_Count": len(findings),
+        "Highest_Severity": get_highest_severity(findings),
         "Issue_Categories": join_unique(
             [finding.category for finding in findings]
         ),
@@ -369,8 +399,9 @@ def analyse_requirement_row(
         "Evidence": join_unique(
             [finding.evidence for finding in findings]
         ),
-        "Highest_Severity": highest_severity,
-        "Explanations": explanations,
+        "Explanations": join_unique(
+            [finding.explanation for finding in findings]
+        ),
         "Clarification_Questions": join_unique(
             [finding.clarification_question for finding in findings]
         ),
@@ -378,282 +409,219 @@ def analyse_requirement_row(
             [finding.rewrite_template for finding in findings]
         ),
         "Risk_To_Assess": "YES" if risk_to_assess else "NO",
-        "Risk_Draft": build_risk_draft(
-            requirement_id=requirement_id,
-            findings=findings,
+        "Risk_Draft": (
+            build_risk_draft(requirement_id, findings)
+            if risk_to_assess
+            else ""
         ),
-        "Analysis_Time_ms": elapsed_ms,
+        "Analysis_Time_ms": round(
+            (perf_counter() - started_at) * 1000,
+            3,
+        ),
     }
 
     return summary, findings
 
 
 # ============================================================
-# Analyse d'un DataFrame complet
+# Analyse d'un tableau complet
 # ============================================================
+
+def validate_input_columns(requirements: pd.DataFrame) -> None:
+    """Vérifie que le tableau a bien été normalisé en amont."""
+
+    missing = [
+        column
+        for column in (CANONICAL_ID, CANONICAL_TEXT)
+        if column not in requirements.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Le tableau d'entrée n'est pas normalisé. Colonnes "
+            "absentes : "
+            + ", ".join(missing)
+            + "\nUtilise src.excel_loader.load_requirements pour "
+            "produire ce tableau."
+        )
+
 
 def analyse_requirements(
     requirements: pd.DataFrame,
     rules: list[Rule],
-    include_non_requirements: bool = False,
+    settings: EngineSettings | None = None,
 ) -> dict[str, Any]:
     """
-    Analyse un DataFrame contenant les colonnes ID, texte et type.
+    Analyse un tableau d'exigences normalisé.
 
-    Par défaut, seuls Technical Req et Non-Technical Req sont inclus.
+    Retour :
+        {
+            "summary":     une ligne par exigence,
+            "findings":    une ligne par occurrence de règle,
+            "diagnostics": statistiques d'exécution,
+        }
     """
 
-    validate_requirement_columns(requirements)
+    settings = settings or EngineSettings()
+    validate_input_columns(requirements)
 
-    started_at = perf_counter()
-    working_dataframe = requirements.copy()
-
-    if not include_non_requirements:
-        normalized_types = (
-            working_dataframe[TYPE_COLUMN]
-            .fillna("")
-            .astype(str)
-            .str.strip()
+    if not rules:
+        raise ValueError(
+            "Aucune règle active : le catalogue est vide ou "
+            "toutes les règles sont désactivées."
         )
 
-        working_dataframe = working_dataframe[
-            normalized_types.isin(ANALYSABLE_OBJECT_TYPES)
-        ].copy()
+    started_at = perf_counter()
 
     summaries: list[dict[str, Any]] = []
     all_findings: list[Finding] = []
 
-    for _, row in working_dataframe.iterrows():
-        summary, row_findings = analyse_requirement_row(
+    for _, row in requirements.iterrows():
+        summary, row_findings = analyse_row(
             row=row,
             rules=rules,
+            settings=settings,
         )
 
         summaries.append(summary)
         all_findings.extend(row_findings)
 
-    summary_dataframe = pd.DataFrame(
+    summary_frame = pd.DataFrame(
         summaries,
         columns=SUMMARY_COLUMNS,
     )
 
-    findings_dataframe = pd.DataFrame(
-        [finding.to_dict() for finding in all_findings],
+    findings_frame = pd.DataFrame(
+        [finding.to_row() for finding in all_findings],
         columns=FINDING_COLUMNS,
     )
 
-    total_time_seconds = perf_counter() - started_at
+    total_seconds = perf_counter() - started_at
+    analysed_count = len(summary_frame)
 
-    status_counts = (
-        summary_dataframe["Quality_Status"]
-        .value_counts()
-        .to_dict()
-        if not summary_dataframe.empty
-        else {}
-    )
+    def value_counts(frame: pd.DataFrame, column: str) -> dict:
+        if frame.empty:
+            return {}
 
-    severity_counts = (
-        findings_dataframe["severity"]
-        .value_counts()
-        .to_dict()
-        if not findings_dataframe.empty
-        else {}
-    )
-
-    category_counts = (
-        findings_dataframe["category"]
-        .value_counts()
-        .to_dict()
-        if not findings_dataframe.empty
-        else {}
-    )
-
-    rule_counts = (
-        findings_dataframe["rule_id"]
-        .value_counts()
-        .to_dict()
-        if not findings_dataframe.empty
-        else {}
-    )
+        return frame[column].value_counts().to_dict()
 
     diagnostics = {
-        "input_row_count": int(len(requirements)),
-        "analysed_row_count": int(len(summary_dataframe)),
-        "finding_count": int(len(findings_dataframe)),
-        "rule_count": int(len(rules)),
-        "requirements_with_findings": int(
-            (summary_dataframe["Issue_Count"] > 0).sum()
-        ) if not summary_dataframe.empty else 0,
-        "requirements_without_findings": int(
-            (summary_dataframe["Issue_Count"] == 0).sum()
-        ) if not summary_dataframe.empty else 0,
-        "risk_assessment_count": int(
-            (summary_dataframe["Risk_To_Assess"] == "YES").sum()
-        ) if not summary_dataframe.empty else 0,
-        "total_time_seconds": round(total_time_seconds, 3),
-        "average_time_ms_per_requirement": round(
-            (total_time_seconds * 1000) / len(summary_dataframe),
+        "analysed_requirement_count": analysed_count,
+        "rule_count": len(rules),
+        "distinct_issue_count": int(
+            summary_frame["Issue_Count"].sum()
+        )
+        if analysed_count
+        else 0,
+        "occurrence_count": int(len(findings_frame)),
+        "requirements_with_issues": int(
+            (summary_frame["Issue_Count"] > 0).sum()
+        )
+        if analysed_count
+        else 0,
+        "requirements_without_issues": int(
+            (summary_frame["Issue_Count"] == 0).sum()
+        )
+        if analysed_count
+        else 0,
+        "flag_rate": round(
+            float((summary_frame["Issue_Count"] > 0).mean()),
+            4,
+        )
+        if analysed_count
+        else 0.0,
+        "average_quality_score": round(
+            float(summary_frame["Quality_Score"].mean()),
+            2,
+        )
+        if analysed_count
+        else 100.0,
+        "risk_to_assess_count": int(
+            (summary_frame["Risk_To_Assess"] == "YES").sum()
+        )
+        if analysed_count
+        else 0,
+        "total_time_seconds": round(total_seconds, 3),
+        "average_time_ms": round(
+            (total_seconds * 1000) / analysed_count,
             3,
-        ) if len(summary_dataframe) > 0 else 0.0,
-        "status_counts": status_counts,
-        "severity_counts": severity_counts,
-        "category_counts": category_counts,
-        "rule_counts": rule_counts,
+        )
+        if analysed_count
+        else 0.0,
+        "status_counts": value_counts(summary_frame, "Quality_Status"),
+        "severity_counts": value_counts(findings_frame, "Severity"),
+        "category_counts": value_counts(findings_frame, "Category"),
+        "rule_counts": value_counts(findings_frame, "Rule_ID"),
     }
 
     return {
-        "summary": summary_dataframe,
-        "findings": findings_dataframe,
+        "summary": summary_frame,
+        "findings": findings_frame,
         "diagnostics": diagnostics,
     }
 
 
 # ============================================================
-# Affichage des résultats
+# Préparation des constats pour le LLM
 # ============================================================
 
-def display_analysis_diagnostics(result: dict[str, Any]) -> None:
-    """Affiche le diagnostic général de l'analyse."""
+def build_llm_findings(
+    requirement_id: str,
+    findings_frame: pd.DataFrame,
+    max_evidence_per_rule: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    Regroupe les occurrences par règle avant l'appel au LLM.
 
-    diagnostics = result["diagnostics"]
+    C'est un point important de fiabilité. Le prompt demande au
+    modèle d'évaluer chaque constat une seule fois par
+    identifiant de règle. Si le même identifiant est envoyé
+    plusieurs fois, parce qu'un mot vague revient dans une
+    exigence longue, le modèle renvoie des évaluations en
+    doublon et le contrôle de cohérence rejette toute la
+    réponse. Une règle correspond donc à un constat unique,
+    accompagné de toutes ses preuves.
+    """
 
-    print("\n" + "=" * 65)
-    print("DIAGNOSTIC DE L'ANALYSE")
-    print("=" * 65)
+    if findings_frame.empty:
+        return []
 
-    print(f"Lignes reçues                  : {diagnostics['input_row_count']}")
-    print(f"Exigences analysées            : {diagnostics['analysed_row_count']}")
-    print(f"Règles chargées                : {diagnostics['rule_count']}")
-    print(f"Anomalies détectées            : {diagnostics['finding_count']}")
-    print(
-        "Exigences avec anomalie       : "
-        f"{diagnostics['requirements_with_findings']}"
-    )
-    print(
-        "Exigences sans anomalie       : "
-        f"{diagnostics['requirements_without_findings']}"
-    )
-    print(
-        "Risques à évaluer             : "
-        f"{diagnostics['risk_assessment_count']}"
-    )
-    print(
-        "Temps total                   : "
-        f"{diagnostics['total_time_seconds']} s"
-    )
-    print(
-        "Temps moyen par exigence      : "
-        f"{diagnostics['average_time_ms_per_requirement']} ms"
-    )
-
-    print("\nRépartition par statut :")
-    for status, count in diagnostics["status_counts"].items():
-        print(f"  - {status}: {count}")
-
-    print("\nRépartition par gravité :")
-    for severity, count in diagnostics["severity_counts"].items():
-        print(f"  - {severity}: {count}")
-
-    print("\nPrincipales catégories :")
-    sorted_categories = sorted(
-        diagnostics["category_counts"].items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    for category, count in sorted_categories[:10]:
-        print(f"  - {category}: {count}")
-
-
-def display_analysis_sample(
-    result: dict[str, Any],
-    limit: int = 10,
-) -> None:
-    """Affiche un aperçu des exigences signalées."""
-
-    summary = result["summary"]
-
-    print("\n" + "=" * 65)
-    print(f"APERÇU DES {limit} PREMIÈRES EXIGENCES SIGNALÉES")
-    print("=" * 65)
-
-    if summary.empty:
-        print("Aucune exigence analysée.")
-        return
-
-    flagged = summary[summary["Issue_Count"] > 0]
-
-    if flagged.empty:
-        print("Aucune anomalie détectée.")
-        return
-
-    columns = [
-        "ID",
-        "ObjectType",
-        "Quality_Status",
-        "Issue_Count",
-        "Triggered_Rules",
-        "Evidence",
+    selected = findings_frame[
+        findings_frame["Requirement_ID"].astype(str)
+        == str(requirement_id)
     ]
 
-    print(
-        flagged[columns]
-        .head(limit)
-        .to_string(index=False, max_colwidth=70)
-    )
+    if selected.empty:
+        return []
 
+    grouped: dict[str, dict[str, Any]] = {}
 
-# ============================================================
-# Test autonome
-# ============================================================
+    for _, row in selected.iterrows():
+        rule_id = clean_value(row.get("Rule_ID"))
 
-def main() -> None:
-    """Test simple du moteur avec quelques exigences."""
+        if not rule_id:
+            continue
 
-    try:
-        from src.rule_loader import load_rules
-    except ModuleNotFoundError:
-        from rule_loader import load_rules
+        if rule_id not in grouped:
+            grouped[rule_id] = {
+                "rule_id": rule_id,
+                "category": clean_value(row.get("Category")),
+                "severity": clean_value(row.get("Severity")),
+                "evidence": [],
+                "occurrence_count": 0,
+                "explanation": clean_value(row.get("Explanation")),
+            }
 
-    test_requirements = pd.DataFrame(
-        [
-            {
-                "ID": "TEST-001",
-                "Object Heading and Object Text": (
-                    "The system should respond rapidly."
-                ),
-                "ObjectType": "Technical Req",
-                "Source_Excel_Row": 2,
-            },
-            {
-                "ID": "TEST-002",
-                "Object Heading and Object Text": (
-                    "The system shall respond within 2 seconds."
-                ),
-                "ObjectType": "Technical Req",
-                "Source_Excel_Row": 3,
-            },
-            {
-                "ID": "TEST-003",
-                "Object Heading and Object Text": (
-                    "The interface shall be intuitive and user-friendly."
-                ),
-                "ObjectType": "Non-Technical Req",
-                "Source_Excel_Row": 4,
-            },
-        ]
-    )
+        entry = grouped[rule_id]
+        entry["occurrence_count"] += 1
 
-    rules_result = load_rules("rules/rules_en.csv")
+        evidence = clean_value(row.get("Evidence"))
 
-    analysis_result = analyse_requirements(
-        requirements=test_requirements,
-        rules=rules_result["rules"],
-    )
+        if (
+            evidence
+            and evidence not in entry["evidence"]
+            and len(entry["evidence"]) < max_evidence_per_rule
+        ):
+            entry["evidence"].append(evidence)
 
-    display_analysis_diagnostics(analysis_result)
-    display_analysis_sample(analysis_result)
-
-
-if __name__ == "__main__":
-    main()
+    return list(grouped.values())

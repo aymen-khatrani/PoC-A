@@ -1,5 +1,21 @@
 # ============================================================
-# Exécution complète du contrôleur qualité des exigences
+# Contrôleur de qualité des exigences - pipeline complet
+# ============================================================
+#
+#     fichier client
+#         -> import normalisé
+#         -> moteur de règles
+#         -> analyse LLM optionnelle sur les cas prioritaires
+#         -> rapport Excel
+#
+# Le script accepte n'importe quel export d'exigences : les
+# colonnes, la feuille, la ligne d'en-tête et le vocabulaire
+# des types sont détectés, et peuvent tous être forcés en
+# ligne de commande.
+#
+# Exemple minimal :
+#     python run_analysis.py -i mon_export.xlsx
+#
 # ============================================================
 
 from __future__ import annotations
@@ -9,663 +25,618 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 
-from src.rule_loader import load_rules
-from src.rule_engine import (
-    analyse_requirements,
-    display_analysis_diagnostics,
-    display_analysis_sample,
+from src import config
+from src.config import (
+    CANONICAL_ID,
+    CANONICAL_TEXT,
+    EngineSettings,
+    LoaderSettings,
 )
+from src.excel_loader import display_diagnostics, load_requirements
+from src.reporting import (
+    diagnostics_to_frame,
+    rules_to_frame,
+    write_report,
+)
+from src.rule_engine import analyse_requirements
+from src.rule_loader import load_rule_catalog
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
-DEFAULT_RULES_PATH = Path("rules/rules_en.csv")
+DEFAULT_RULES_PATH = Path("rules")
 DEFAULT_OUTPUT_DIRECTORY = Path("data/output")
 
 
 # ============================================================
-# Chargement du module Excel
+# Ligne de commande
 # ============================================================
 
-def get_excel_loader() -> Callable[[str], dict[str, Any]]:
-    """
-    Recherche la fonction de chargement Excel existante.
-
-    Le projet peut contenir l'une des fonctions suivantes :
-    - src.excel_loader.load_requirements ;
-    - src.excel_loader.load_required_columns ;
-    - load_excel.load_required_columns.
-    """
-
-    try:
-        from src.excel_loader import load_requirements
-
-        return load_requirements
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-    try:
-        from src.excel_loader import load_required_columns
-
-        return load_required_columns
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-    try:
-        from load_excel import load_required_columns
-
-        return load_required_columns
-    except (ImportError, ModuleNotFoundError) as error:
-        raise ImportError(
-            "Impossible de trouver la fonction de chargement Excel. "
-            "Le projet doit contenir l'une des fonctions suivantes : "
-            "src.excel_loader.load_requirements, "
-            "src.excel_loader.load_required_columns ou "
-            "load_excel.load_required_columns."
-        ) from error
-
-
-# ============================================================
-# Arguments de la ligne de commande
-# ============================================================
-
-def parse_arguments() -> argparse.Namespace:
-    """Lit les arguments fournis dans PowerShell."""
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Décrit toutes les options du pipeline."""
 
     parser = argparse.ArgumentParser(
         description=(
-            "Analyse un export Excel DOORS avec le catalogue "
-            "de règles de qualité."
-        )
+            "Analyse la qualité rédactionnelle d'un export "
+            "d'exigences client (Excel ou CSV)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exemples :\n"
+            "  python run_analysis.py -i export.xlsx\n"
+            "  python run_analysis.py -i export.xlsx "
+            "--text-column \"Requirement Description\"\n"
+            "  python run_analysis.py -i export.xlsx --llm "
+            "--llm-limit 20\n"
+        ),
     )
 
-    parser.add_argument(
+    source = parser.add_argument_group("fichier source")
+
+    source.add_argument(
         "--input",
         "-i",
-        dest="input_path",
-        help="Chemin du fichier Excel DOORS à analyser.",
+        required=True,
+        help="Export d'exigences à analyser (.xlsx, .xlsm, .csv).",
+    )
+    source.add_argument(
+        "--sheet",
+        help=(
+            "Feuille à lire. Par défaut, la feuille dont "
+            "l'en-tête est le plus reconnaissable."
+        ),
+    )
+    source.add_argument(
+        "--header-row",
+        type=int,
+        help=(
+            "Numéro de la ligne d'en-tête dans Excel "
+            "(1 pour la première ligne). Détecté par défaut."
+        ),
     )
 
-    parser.add_argument(
+    columns = parser.add_argument_group(
+        "colonnes",
+        "À préciser seulement si la détection automatique se "
+        "trompe.",
+    )
+
+    columns.add_argument("--id-column", help="Colonne identifiant.")
+    columns.add_argument(
+        "--text-column",
+        help="Colonne du texte de l'exigence.",
+    )
+    columns.add_argument(
+        "--heading-column",
+        help="Colonne de l'intitulé, si elle est séparée.",
+    )
+    columns.add_argument(
+        "--type-column",
+        help="Colonne du type d'objet.",
+    )
+    columns.add_argument(
+        "--no-combine-heading",
+        action="store_true",
+        help=(
+            "N'analyse que le corps du texte, sans y joindre "
+            "l'intitulé."
+        ),
+    )
+
+    filtering = parser.add_argument_group("filtrage des lignes")
+
+    filtering.add_argument(
+        "--include-types",
+        nargs="+",
+        default=[],
+        metavar="TYPE",
+        help=(
+            "N'analyse que ces types d'objet. Comparaison "
+            "insensible à la casse et aux accents."
+        ),
+    )
+    filtering.add_argument(
+        "--exclude-types",
+        nargs="+",
+        default=[],
+        metavar="TYPE",
+        help="Exclut ces types d'objet.",
+    )
+    filtering.add_argument(
+        "--keep-headings",
+        action="store_true",
+        help=(
+            "Analyse aussi les textes courts identifiés comme "
+            "intitulés quand aucune colonne de type n'existe."
+        ),
+    )
+
+    rules = parser.add_argument_group("catalogue de règles")
+
+    rules.add_argument(
         "--rules",
         "-r",
-        dest="rules_path",
-        default=str(DEFAULT_RULES_PATH),
+        nargs="+",
+        default=[str(DEFAULT_RULES_PATH)],
         help=(
-            "Chemin du catalogue CSV. "
-            "Valeur par défaut : rules/rules_en.csv"
+            "Fichiers CSV ou dossiers de règles. "
+            "Défaut : le dossier rules/."
+        ),
+    )
+    rules.add_argument(
+        "--non-strict-rules",
+        action="store_true",
+        help=(
+            "Ignore les règles invalides au lieu d'arrêter "
+            "l'exécution."
         ),
     )
 
-    parser.add_argument(
+    llm = parser.add_argument_group("analyse LLM locale")
+
+    llm.add_argument(
+        "--llm",
+        action="store_true",
+        help="Active l'analyse contextuelle par LLM local.",
+    )
+    llm.add_argument(
+        "--model",
+        default="qwen2.5:3b",
+        help="Modèle Ollama. Défaut : qwen2.5:3b.",
+    )
+    llm.add_argument(
+        "--host",
+        default="http://localhost:11434",
+        help="Adresse du service Ollama.",
+    )
+    llm.add_argument(
+        "--llm-limit",
+        type=int,
+        default=20,
+        help=(
+            "Nombre maximal d'exigences envoyées au modèle. "
+            "Utiliser -1 pour tout envoyer. Défaut : 20."
+        ),
+    )
+    llm.add_argument(
+        "--llm-min-severity",
+        default="MEDIUM",
+        choices=sorted(config.ALLOWED_SEVERITIES),
+        help=(
+            "Gravité minimale pour être envoyé au modèle. "
+            "Défaut : MEDIUM."
+        ),
+    )
+    llm.add_argument(
+        "--llm-include-clean",
+        action="store_true",
+        help=(
+            "Envoie aussi les exigences sans alerte, en revue "
+            "contextuelle complète."
+        ),
+    )
+
+    output = parser.add_argument_group("sortie")
+
+    output.add_argument(
         "--output",
         "-o",
-        dest="output_path",
         help=(
-            "Chemin du rapport Excel à créer. Si non fourni, "
-            "le rapport est créé dans data/output."
+            "Rapport Excel à produire. Par défaut dans "
+            "data/output avec un horodatage."
         ),
     )
-
-    parser.add_argument(
-        "--sample-size",
+    output.add_argument(
+        "--sample",
         type=int,
         default=10,
         help="Nombre d'exigences signalées à afficher. Défaut : 10.",
     )
 
-    parser.add_argument(
-        "--include-non-requirements",
-        action="store_true",
-        help=(
-            "Inclut également Heading, Information et les autres "
-            "types dans le résumé avec le statut NON_ANALYSABLE."
-        ),
-    )
+    return parser
 
-    parser.add_argument(
-        "--non-strict-rules",
-        action="store_true",
-        help=(
-            "Ignore les règles CSV invalides au lieu d'arrêter "
-            "l'exécution."
-        ),
-    )
-
-    return parser.parse_args()
-
-
-# ============================================================
-# Gestion des chemins
-# ============================================================
 
 def clean_path(value: str) -> Path:
-    """Nettoie et résout un chemin saisi par l'utilisateur."""
+    """Nettoie un chemin collé depuis un terminal."""
 
-    cleaned_value = value.strip().strip('"').strip("'")
-    return Path(cleaned_value).expanduser().resolve()
-
-
-def ask_for_input_path() -> Path:
-    """Demande le chemin Excel si aucun argument n'a été fourni."""
-
-    value = input("\nChemin du fichier Excel : ").strip()
-
-    if not value:
-        raise ValueError("Aucun chemin de fichier Excel n'a été fourni.")
-
-    return clean_path(value)
+    return (
+        Path(value.strip().strip('"').strip("'"))
+        .expanduser()
+        .resolve()
+    )
 
 
 def build_default_output_path(input_path: Path) -> Path:
-    """Construit automatiquement le nom du rapport de sortie."""
+    """Construit un nom de rapport horodaté."""
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_name = f"{input_path.stem}_quality_analysis_{timestamp}.xlsx"
 
-    return (DEFAULT_OUTPUT_DIRECTORY / output_name).resolve()
-
-
-def validate_input_path(input_path: Path) -> None:
-    """Vérifie que le fichier Excel d'entrée est exploitable."""
-
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Le fichier Excel est introuvable :\n{input_path}"
-        )
-
-    if not input_path.is_file():
-        raise ValueError(
-            f"Le chemin ne correspond pas à un fichier :\n{input_path}"
-        )
-
-    if input_path.suffix.lower() not in {".xlsx", ".xlsm"}:
-        raise ValueError(
-            "Le fichier d'entrée doit être au format .xlsx ou .xlsm."
-        )
-
-
-def validate_output_path(output_path: Path) -> None:
-    """Vérifie le format du rapport de sortie."""
-
-    if output_path.suffix.lower() != ".xlsx":
-        raise ValueError(
-            "Le rapport de sortie doit avoir l'extension .xlsx."
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return (
+        DEFAULT_OUTPUT_DIRECTORY
+        / f"{input_path.stem}_qualite_{timestamp}.xlsx"
+    ).resolve()
 
 
 # ============================================================
-# Préparation des données de diagnostic
+# Affichage
 # ============================================================
 
-def dictionary_to_dataframe(
-    data: dict[str, Any],
-    section_name: str,
-) -> pd.DataFrame:
-    """Transforme un dictionnaire, y compris imbriqué, en tableau."""
+def print_section(title: str) -> None:
+    """Affiche un titre de section."""
 
-    rows: list[dict[str, Any]] = []
-
-    for key, value in data.items():
-        if isinstance(value, dict):
-            for nested_key, nested_value in value.items():
-                rows.append(
-                    {
-                        "Section": section_name,
-                        "Metric": f"{key}.{nested_key}",
-                        "Value": nested_value,
-                    }
-                )
-        else:
-            rows.append(
-                {
-                    "Section": section_name,
-                    "Metric": key,
-                    "Value": value,
-                }
-            )
-
-    return pd.DataFrame(rows, columns=["Section", "Metric", "Value"])
+    print("\n" + "=" * 65)
+    print(title)
+    print("=" * 65)
 
 
-def prepare_rules_dataframe(rules: list[Any]) -> pd.DataFrame:
-    """Convertit les règles chargées en tableau exportable."""
+def display_engine_diagnostics(diagnostics: dict[str, Any]) -> None:
+    """Affiche le bilan du moteur de règles."""
 
-    rows = []
-
-    for rule in rules:
-        if hasattr(rule, "to_dict"):
-            rows.append(rule.to_dict())
-        else:
-            rows.append(
-                {
-                    "rule_id": getattr(rule, "rule_id", ""),
-                    "category": getattr(rule, "category", ""),
-                    "pattern": getattr(rule, "pattern", ""),
-                    "severity": getattr(rule, "severity", ""),
-                    "explanation": getattr(rule, "explanation", ""),
-                    "clarification_question": getattr(
-                        rule,
-                        "clarification_question",
-                        "",
-                    ),
-                    "rewrite_template": getattr(
-                        rule,
-                        "rewrite_template",
-                        "",
-                    ),
-                    "enabled": getattr(rule, "enabled", False),
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-# ============================================================
-# Mise en forme du rapport Excel
-# ============================================================
-
-def format_worksheet(worksheet) -> None:
-    """Applique une mise en forme simple et lisible à une feuille."""
-
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    header_fill = PatternFill(
-        fill_type="solid",
-        fgColor="1F4E78",
+    print(
+        f"Exigences analysées        : "
+        f"{diagnostics['analysed_requirement_count']}"
     )
-    header_font = Font(
-        color="FFFFFF",
-        bold=True,
+    print(f"Règles appliquées          : {diagnostics['rule_count']}")
+    print(
+        f"Exigences avec alerte      : "
+        f"{diagnostics['requirements_with_issues']} "
+        f"({diagnostics['flag_rate']:.0%})"
+    )
+    print(
+        f"Défauts distincts          : "
+        f"{diagnostics['distinct_issue_count']} "
+        f"({diagnostics['occurrence_count']} occurrences)"
+    )
+    print(
+        f"Score qualité moyen        : "
+        f"{diagnostics['average_quality_score']}/100"
+    )
+    print(
+        f"Risques à évaluer          : "
+        f"{diagnostics['risk_to_assess_count']}"
+    )
+    print(
+        f"Temps total                : "
+        f"{diagnostics['total_time_seconds']} s "
+        f"({diagnostics['average_time_ms']} ms par exigence)"
     )
 
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
+    print("\nRépartition des statuts :")
+    for status, count in diagnostics["status_counts"].items():
+        print(f"  - {status}: {count}")
 
-    for cell in worksheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-            wrap_text=True,
+    if diagnostics["category_counts"]:
+        print("\nPrincipales catégories de défauts :")
+
+        ranked = sorted(
+            diagnostics["category_counts"].items(),
+            key=lambda item: item[1],
+            reverse=True,
         )
 
-    for row in worksheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(
-                vertical="top",
-                wrap_text=True,
-            )
-
-    for column_index, column_cells in enumerate(
-        worksheet.iter_cols(),
-        start=1,
-    ):
-        max_length = 0
-
-        for cell in column_cells[:100]:
-            value = "" if cell.value is None else str(cell.value)
-            max_line_length = max(
-                (len(line) for line in value.splitlines()),
-                default=0,
-            )
-            max_length = max(max_length, max_line_length)
-
-        width = min(max(max_length + 2, 12), 60)
-        column_letter = get_column_letter(column_index)
-        worksheet.column_dimensions[column_letter].width = width
+        for category, count in ranked[:10]:
+            print(f"  - {category}: {count}")
 
 
-def apply_status_formatting(worksheet) -> None:
-    """Colore les cellules de statut du résumé."""
+def display_sample(summary: pd.DataFrame, limit: int) -> None:
+    """Affiche un aperçu des exigences les plus douteuses."""
 
-    from openpyxl.styles import PatternFill
-
-    headers = {
-        cell.value: cell.column
-        for cell in worksheet[1]
-    }
-
-    status_column = headers.get("Quality_Status")
-
-    if status_column is None:
+    if limit <= 0 or summary.empty:
         return
 
-    fills = {
-        "PRE_ANALYSIS_OK": PatternFill(
-            fill_type="solid",
-            fgColor="C6E0B4",
-        ),
-        "REVIEW_REQUIRED": PatternFill(
-            fill_type="solid",
-            fgColor="FCE4D6",
-        ),
-        "CLARIFICATION_REQUIRED": PatternFill(
-            fill_type="solid",
-            fgColor="F4B084",
-        ),
-        "NON_ANALYSABLE": PatternFill(
-            fill_type="solid",
-            fgColor="F4CCCC",
-        ),
-    }
+    flagged = summary[summary["Issue_Count"] > 0]
 
-    for row_index in range(2, worksheet.max_row + 1):
-        cell = worksheet.cell(row=row_index, column=status_column)
-        fill = fills.get(str(cell.value))
+    if flagged.empty:
+        print("\nAucune alerte sur ce fichier.")
+        return
 
-        if fill is not None:
-            cell.fill = fill
+    print_section(f"APERÇU DES {min(limit, len(flagged))} CAS PRIORITAIRES")
+
+    columns = [
+        CANONICAL_ID,
+        "Quality_Status",
+        "Quality_Score",
+        "Issue_Count",
+        "Triggered_Rules",
+        "Evidence",
+    ]
+
+    print(
+        flagged.sort_values("Quality_Score")[columns]
+        .head(limit)
+        .to_string(index=False, max_colwidth=45)
+    )
 
 
 # ============================================================
-# Export du rapport
+# Pipeline
 # ============================================================
 
-def export_analysis_report(
-    output_path: Path,
-    analysis_result: dict[str, Any],
-    excel_result: dict[str, Any],
-    rules_result: dict[str, Any],
-    input_path: Path,
-    rules_path: Path,
-    execution_time_seconds: float,
-) -> None:
-    """Crée le rapport Excel consolidé."""
-
-    summary_dataframe = analysis_result["summary"].copy()
-    findings_dataframe = analysis_result["findings"].copy()
-
-    excel_diagnostics = dictionary_to_dataframe(
-        excel_result.get("diagnostics", {}),
-        "Excel import",
-    )
-
-    rule_diagnostics = dictionary_to_dataframe(
-        rules_result.get("diagnostics", {}),
-        "Rule loading",
-    )
-
-    analysis_diagnostics = dictionary_to_dataframe(
-        analysis_result.get("diagnostics", {}),
-        "Requirement analysis",
-    )
-
-    run_information = pd.DataFrame(
-        [
-            {"Parameter": "Input file", "Value": str(input_path)},
-            {"Parameter": "Rules file", "Value": str(rules_path)},
-            {"Parameter": "Output file", "Value": str(output_path)},
-            {
-                "Parameter": "Execution date",
-                "Value": datetime.now().isoformat(timespec="seconds"),
-            },
-            {
-                "Parameter": "Total execution time seconds",
-                "Value": round(execution_time_seconds, 3),
-            },
-        ]
-    )
-
-    diagnostics_dataframe = pd.concat(
-        [
-            excel_diagnostics,
-            rule_diagnostics,
-            analysis_diagnostics,
-        ],
-        ignore_index=True,
-    )
-
-    rules_dataframe = prepare_rules_dataframe(
-        rules_result.get("all_valid_rules", rules_result["rules"])
-    )
-
-    invalid_requirements = excel_result.get(
-        "invalid_requirements",
-        pd.DataFrame(),
-    )
-
-    ignored_objects = excel_result.get(
-        "ignored_objects",
-        pd.DataFrame(),
-    )
-
-    try:
-        with pd.ExcelWriter(
-            output_path,
-            engine="openpyxl",
-        ) as writer:
-            summary_dataframe.to_excel(
-                writer,
-                sheet_name="Analysis_Results",
-                index=False,
-            )
-
-            findings_dataframe.to_excel(
-                writer,
-                sheet_name="Findings",
-                index=False,
-            )
-
-            diagnostics_dataframe.to_excel(
-                writer,
-                sheet_name="Diagnostics",
-                index=False,
-            )
-
-            run_information.to_excel(
-                writer,
-                sheet_name="Run_Information",
-                index=False,
-            )
-
-            rules_dataframe.to_excel(
-                writer,
-                sheet_name="Rules_Used",
-                index=False,
-            )
-
-            if isinstance(invalid_requirements, pd.DataFrame):
-                invalid_requirements.to_excel(
-                    writer,
-                    sheet_name="Invalid_Requirements",
-                    index=False,
-                )
-
-            if isinstance(ignored_objects, pd.DataFrame):
-                ignored_objects.to_excel(
-                    writer,
-                    sheet_name="Ignored_Objects",
-                    index=False,
-                )
-
-            for worksheet in writer.book.worksheets:
-                format_worksheet(worksheet)
-
-            apply_status_formatting(
-                writer.book["Analysis_Results"]
-            )
-
-    except PermissionError as error:
-        raise PermissionError(
-            "Impossible d'écrire le rapport. Ferme le fichier dans "
-            "Excel puis relance l'analyse."
-        ) from error
-
-
-# ============================================================
-# Exécution principale
-# ============================================================
-
-def run_analysis(
-    input_path: Path,
-    rules_path: Path,
-    output_path: Path,
-    sample_size: int = 10,
-    include_non_requirements: bool = False,
-    strict_rules: bool = True,
-) -> dict[str, Any]:
-    """Exécute la chaîne complète d'analyse."""
-
-    validate_input_path(input_path)
-    validate_output_path(output_path)
-
-    if not rules_path.exists():
-        raise FileNotFoundError(
-            f"Le catalogue de règles est introuvable :\n{rules_path}"
-        )
+def run_pipeline(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Exécute la chaîne complète et écrit le rapport."""
 
     started_at = perf_counter()
 
-    print("\n" + "=" * 65)
-    print("1. CHARGEMENT DU FICHIER EXCEL")
-    print("=" * 65)
+    input_path = clean_path(arguments.input)
 
-    excel_loader = get_excel_loader()
-    excel_result = excel_loader(str(input_path))
+    output_path = (
+        clean_path(arguments.output)
+        if arguments.output
+        else build_default_output_path(input_path)
+    )
 
-    requirements = excel_result.get("requirements")
+    loader_settings = LoaderSettings(
+        sheet_name=arguments.sheet,
+        id_column=arguments.id_column,
+        text_column=arguments.text_column,
+        type_column=arguments.type_column,
+        heading_column=arguments.heading_column,
+        header_row=(
+            arguments.header_row - 1
+            if arguments.header_row is not None
+            else None
+        ),
+        combine_heading_and_text=not arguments.no_combine_heading,
+        include_types=tuple(arguments.include_types),
+        exclude_types=tuple(arguments.exclude_types),
+        detect_headings_without_type=not arguments.keep_headings,
+    )
 
-    if not isinstance(requirements, pd.DataFrame):
+    # ------------------------------------------------------
+    # 1. Import
+    # ------------------------------------------------------
+
+    print_section("1. IMPORT DU FICHIER")
+
+    excel_result = load_requirements(
+        file_path=input_path,
+        settings=loader_settings,
+    )
+
+    display_diagnostics(excel_result)
+
+    requirements = excel_result["requirements"]
+
+    if requirements.empty:
         raise ValueError(
-            "Le chargeur Excel n'a pas retourné le DataFrame "
-            "result['requirements']."
+            "Aucune exigence analysable n'a été retenue. "
+            "Consulte les avertissements ci-dessus, puis ajuste "
+            "--text-column, --type-column ou --include-types."
         )
 
-    print(f"Exigences prêtes : {len(requirements)}")
+    # ------------------------------------------------------
+    # 2. Catalogue
+    # ------------------------------------------------------
 
-    print("\n" + "=" * 65)
-    print("2. CHARGEMENT DU CATALOGUE DE RÈGLES")
-    print("=" * 65)
+    print_section("2. CATALOGUE DE RÈGLES")
 
-    rules_result = load_rules(
-        rules_path=rules_path,
+    rules_result = load_rule_catalog(
+        paths=list(arguments.rules),
         include_disabled=False,
-        strict=strict_rules,
+        strict=not arguments.non_strict_rules,
     )
 
     rules = rules_result["rules"]
-    print(f"Règles actives : {len(rules)}")
 
-    if not rules:
-        raise ValueError("Aucune règle active n'a été chargée.")
+    print(
+        f"Fichiers chargés           : "
+        f"{rules_result['diagnostics']['file_name']}"
+    )
+    print(f"Règles actives             : {len(rules)}")
 
-    print("\n" + "=" * 65)
-    print("3. ANALYSE DES EXIGENCES")
-    print("=" * 65)
+    if rules_result["errors"]:
+        print(f"Règles ignorées            : {len(rules_result['errors'])}")
+
+        for message in rules_result["errors"][:5]:
+            print(f"  ! {message}")
+
+    # ------------------------------------------------------
+    # 3. Moteur de règles
+    # ------------------------------------------------------
+
+    print_section("3. ANALYSE PAR RÈGLES")
 
     analysis_result = analyse_requirements(
         requirements=requirements,
         rules=rules,
-        include_non_requirements=include_non_requirements,
+        settings=EngineSettings(),
     )
 
-    display_analysis_diagnostics(analysis_result)
-    display_analysis_sample(
-        analysis_result,
-        limit=max(sample_size, 0),
+    display_engine_diagnostics(analysis_result["diagnostics"])
+
+    summary = analysis_result["summary"]
+    findings = analysis_result["findings"]
+
+    # ------------------------------------------------------
+    # 4. Analyse LLM optionnelle
+    # ------------------------------------------------------
+
+    llm_diagnostics: dict[str, Any] = {
+        "llm_enabled": arguments.llm,
+    }
+
+    if arguments.llm:
+        print_section("4. ANALYSE CONTEXTUELLE LLM")
+
+        # Import tardif : le mode règles seules ne requiert pas
+        # le paquet ollama.
+        from src.llm_analyzer import (
+            LLMSettings,
+            analyze_batch,
+            display_llm_diagnostics,
+            merge_llm_results,
+            select_llm_candidates,
+        )
+
+        candidates = select_llm_candidates(
+            summary_frame=summary,
+            limit=(
+                None
+                if arguments.llm_limit is not None
+                and arguments.llm_limit < 0
+                else arguments.llm_limit
+            ),
+            minimum_severity=arguments.llm_min_severity,
+            include_clean=arguments.llm_include_clean,
+        )
+
+        print(f"Exigences sélectionnées    : {len(candidates)}")
+
+        if candidates.empty:
+            print(
+                "Aucune exigence ne remplit les critères de "
+                "sélection : analyse LLM ignorée."
+            )
+            llm_diagnostics["selected_count"] = 0
+        else:
+            llm_result = analyze_batch(
+                candidates=candidates,
+                findings_frame=findings,
+                settings=LLMSettings(
+                    model=arguments.model,
+                    host=arguments.host,
+                ),
+            )
+
+            display_llm_diagnostics(llm_result)
+
+            summary = merge_llm_results(
+                summary_frame=summary,
+                llm_frame=llm_result["dataframe"],
+            )
+
+            llm_diagnostics.update(llm_result["diagnostics"])
+            llm_diagnostics["selected_count"] = len(candidates)
+
+    # ------------------------------------------------------
+    # 5. Aperçu et rapport
+    # ------------------------------------------------------
+
+    display_sample(summary, arguments.sample)
+
+    print_section("5. RAPPORT EXCEL")
+
+    execution_seconds = perf_counter() - started_at
+
+    run_information = pd.DataFrame(
+        [
+            {"Parameter": "Fichier analysé", "Value": str(input_path)},
+            {
+                "Parameter": "Feuille",
+                "Value": excel_result["diagnostics"]["sheet_name"],
+            },
+            {
+                "Parameter": "Colonne texte",
+                "Value": excel_result["diagnostics"]["column_text"],
+            },
+            {
+                "Parameter": "Catalogue",
+                "Value": rules_result["diagnostics"]["file_path"],
+            },
+            {"Parameter": "Règles actives", "Value": len(rules)},
+            {
+                "Parameter": "Analyse LLM",
+                "Value": "oui" if arguments.llm else "non",
+            },
+            {
+                "Parameter": "Modèle",
+                "Value": arguments.model if arguments.llm else "non utilisé",
+            },
+            {"Parameter": "Rapport", "Value": str(output_path)},
+            {
+                "Parameter": "Date d'exécution",
+                "Value": datetime.now().isoformat(timespec="seconds"),
+            },
+            {
+                "Parameter": "Durée totale (s)",
+                "Value": round(execution_seconds, 2),
+            },
+        ]
     )
 
-    execution_time_seconds = perf_counter() - started_at
+    diagnostics_frame = pd.concat(
+        [
+            diagnostics_to_frame(
+                excel_result["diagnostics"],
+                "Import",
+            ),
+            diagnostics_to_frame(
+                rules_result["diagnostics"],
+                "Catalogue",
+            ),
+            diagnostics_to_frame(
+                analysis_result["diagnostics"],
+                "Moteur de regles",
+            ),
+            diagnostics_to_frame(llm_diagnostics, "LLM"),
+        ],
+        ignore_index=True,
+    )
 
-    print("\n" + "=" * 65)
-    print("4. CRÉATION DU RAPPORT EXCEL")
-    print("=" * 65)
-
-    export_analysis_report(
+    write_report(
         output_path=output_path,
-        analysis_result=analysis_result,
-        excel_result=excel_result,
-        rules_result=rules_result,
-        input_path=input_path,
-        rules_path=rules_path,
-        execution_time_seconds=execution_time_seconds,
+        sheets={
+            "Analysis_Results": summary,
+            "Rule_Findings": findings,
+            "Excluded_Rows": excel_result["excluded"],
+            "Diagnostics": diagnostics_frame,
+            "Run_Information": run_information,
+            "Rules_Used": rules_to_frame(
+                rules_result["all_valid_rules"]
+            ),
+        },
     )
 
-    print(f"Rapport créé : {output_path}")
-    print(
-        "Temps total : "
-        f"{round(perf_counter() - started_at, 3)} seconde(s)"
-    )
+    print(f"Rapport écrit              : {output_path}")
+    print(f"Durée totale               : {execution_seconds:.2f} s")
 
     return {
-        "excel": excel_result,
+        "import": excel_result,
         "rules": rules_result,
         "analysis": analysis_result,
+        "summary": summary,
         "output_path": output_path,
     }
 
 
+# ============================================================
+# Point d'entrée
+# ============================================================
+
 def main() -> None:
-    """Point d'entrée du script."""
+    """Exécute le pipeline et traduit les erreurs en messages."""
 
     print("=" * 65)
     print("CONTRÔLEUR DE QUALITÉ DES EXIGENCES")
     print("=" * 65)
 
-    arguments = parse_arguments()
+    arguments = build_argument_parser().parse_args()
 
     try:
-        input_path = (
-            clean_path(arguments.input_path)
-            if arguments.input_path
-            else ask_for_input_path()
-        )
+        run_pipeline(arguments)
 
-        rules_path = clean_path(arguments.rules_path)
-
-        output_path = (
-            clean_path(arguments.output_path)
-            if arguments.output_path
-            else build_default_output_path(input_path)
-        )
-
-        run_analysis(
-            input_path=input_path,
-            rules_path=rules_path,
-            output_path=output_path,
-            sample_size=arguments.sample_size,
-            include_non_requirements=(
-                arguments.include_non_requirements
-            ),
-            strict_rules=not arguments.non_strict_rules,
-        )
-
-        print("\n" + "=" * 65)
-        print("ANALYSE TERMINÉE AVEC SUCCÈS")
-        print("=" * 65)
+        print_section("ANALYSE TERMINÉE")
 
     except KeyboardInterrupt:
         print("\nAnalyse interrompue par l'utilisateur.")
-        raise SystemExit(1)
+        raise SystemExit(130)
 
     except (
+        ConnectionError,
         FileNotFoundError,
         ImportError,
         PermissionError,
         ValueError,
     ) as error:
-        print("\n" + "=" * 65)
-        print("ERREUR")
-        print("=" * 65)
+        print_section("ERREUR")
         print(error)
         raise SystemExit(1) from error
 
     except Exception as error:
-        print("\n" + "=" * 65)
-        print("ERREUR INATTENDUE")
-        print("=" * 65)
-        print(f"Type : {type(error).__name__}")
+        print_section("ERREUR INATTENDUE")
+        print(f"Type    : {type(error).__name__}")
         print(f"Message : {error}")
         raise SystemExit(1) from error
 

@@ -1,5 +1,25 @@
-pandas
-openpyxl
-streamlit
-pydantic
-pytest
+# ============================================================
+# Dependances du controleur de qualite des exigences
+# ============================================================
+#
+# Installation :
+#     python -m pip install -r requirements.txt
+#
+# Les versions sont bornees en majeur pour que le projet reste
+# reproductible sans bloquer les correctifs de securite.
+
+# --- Noyau : lecture des fichiers et analyse par regles ------
+pandas>=2.0,<4.0
+openpyxl>=3.1,<4.0
+
+# --- Analyse LLM locale (optionnelle) -----------------------
+# Le mode regles seules fonctionne sans ce paquet : il n'est
+# importe qu'au moment ou --llm est demande.
+ollama>=0.3,<1.0
+
+# --- Tests --------------------------------------------------
+pytest>=8.0,<10.0
+
+# Retires volontairement :
+#   streamlit : aucune interface n'est encore implementee
+#   pydantic  : aucune validation de schema n'en depend

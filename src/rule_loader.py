@@ -2,12 +2,15 @@
 # Imports
 # ============================================================
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import re
 from typing import Pattern
 
 import pandas as pd
+
+from src import config
 
 
 # ============================================================
@@ -25,12 +28,7 @@ REQUIRED_RULE_COLUMNS = [
     "enabled",
 ]
 
-ALLOWED_SEVERITIES = {
-    "LOW",
-    "MEDIUM",
-    "HIGH",
-    "CRITICAL",
-}
+ALLOWED_SEVERITIES = set(config.ALLOWED_SEVERITIES)
 
 TRUE_VALUES = {
     "true",
@@ -425,6 +423,11 @@ def load_rules(
             dtype=object,
             encoding="utf-8-sig",
             keep_default_na=False,
+            # Les catalogues sont souvent alignés à la main avec
+            # des espaces après les virgules. Sans cette option,
+            # un champ aligné perd ses guillemets et le fichier
+            # devient illisible.
+            skipinitialspace=True,
         )
 
     except UnicodeDecodeError as error:
@@ -489,11 +492,9 @@ def load_rules(
     rule_ids = [rule.rule_id for rule in all_valid_rules]
 
     duplicate_rule_ids = sorted(
-        {
-            rule_id
-            for rule_id in rule_ids
-            if rule_ids.count(rule_id) > 1
-        }
+        rule_id
+        for rule_id, count in Counter(rule_ids).items()
+        if count > 1
     )
 
     if duplicate_rule_ids:
@@ -575,6 +576,150 @@ def load_rules(
         "disabled_rules": disabled_rules,
         "errors": errors,
         "diagnostics": diagnostics,
+    }
+
+
+# ============================================================
+# Chargement d'un catalogue réparti sur plusieurs fichiers
+# ============================================================
+
+def expand_catalog_paths(
+    paths: list[str | Path] | str | Path,
+) -> list[Path]:
+    """
+    Développe une liste de chemins en liste de fichiers CSV.
+
+    Un dossier est développé en tous les fichiers .csv qu'il
+    contient, triés par nom. Cela permet de distribuer le
+    catalogue par domaine, par exemple un fichier commun et un
+    fichier propre à un client.
+    """
+
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+
+    expanded: list[Path] = []
+
+    for item in paths:
+        path = Path(item).expanduser().resolve()
+
+        if path.is_dir():
+            csv_files = sorted(path.glob("*.csv"))
+
+            if not csv_files:
+                raise FileNotFoundError(
+                    f"Aucun fichier .csv dans le dossier :\n{path}"
+                )
+
+            expanded.extend(csv_files)
+            continue
+
+        expanded.append(path)
+
+    # Un même fichier fourni deux fois ne doit pas provoquer
+    # une erreur de doublons.
+    unique_paths: list[Path] = []
+
+    for path in expanded:
+        if path not in unique_paths:
+            unique_paths.append(path)
+
+    return unique_paths
+
+
+def load_rule_catalog(
+    paths: list[str | Path] | str | Path = DEFAULT_RULES_PATH,
+    include_disabled: bool = False,
+    strict: bool = True,
+) -> dict:
+    """
+    Charge un catalogue réparti sur un ou plusieurs fichiers.
+
+    Le retour a la même forme que load_rules, avec en plus la
+    liste des fichiers utilisés et l'origine de chaque règle.
+    """
+
+    catalog_paths = expand_catalog_paths(paths)
+
+    merged_rules: list[Rule] = []
+    all_valid_rules: list[Rule] = []
+    disabled_rules: list[Rule] = []
+    errors: list[str] = []
+    rule_origin: dict[str, str] = {}
+
+    for path in catalog_paths:
+        result = load_rules(
+            rules_path=path,
+            include_disabled=include_disabled,
+            strict=strict,
+        )
+
+        for rule in result["all_valid_rules"]:
+            previous_file = rule_origin.get(rule.rule_id)
+
+            if previous_file is not None:
+                message = (
+                    f"La règle {rule.rule_id!r} est définie dans "
+                    f"{previous_file} et dans {path.name}."
+                )
+
+                if strict:
+                    raise ValueError(message)
+
+                errors.append(message)
+                continue
+
+            rule_origin[rule.rule_id] = path.name
+            all_valid_rules.append(rule)
+
+            if rule.enabled:
+                merged_rules.append(rule)
+            else:
+                disabled_rules.append(rule)
+
+                if include_disabled:
+                    merged_rules.append(rule)
+
+        errors.extend(result["errors"])
+
+    categories: dict[str, int] = {}
+    severities: dict[str, int] = {}
+
+    for rule in all_valid_rules:
+        if not rule.enabled:
+            continue
+
+        categories[rule.category] = (
+            categories.get(rule.category, 0) + 1
+        )
+        severities[rule.severity] = (
+            severities.get(rule.severity, 0) + 1
+        )
+
+    diagnostics = {
+        "file_name": ", ".join(path.name for path in catalog_paths),
+        "file_path": ", ".join(str(path) for path in catalog_paths),
+        "file_count": len(catalog_paths),
+        "csv_row_count": len(all_valid_rules),
+        "valid_rule_count": len(all_valid_rules),
+        "enabled_rule_count": len(
+            [rule for rule in all_valid_rules if rule.enabled]
+        ),
+        "disabled_rule_count": len(disabled_rules),
+        "returned_rule_count": len(merged_rules),
+        "error_count": len(errors),
+        "categories": dict(sorted(categories.items())),
+        "severities": dict(sorted(severities.items())),
+    }
+
+    return {
+        "rules": merged_rules,
+        "all_valid_rules": all_valid_rules,
+        "disabled_rules": disabled_rules,
+        "errors": errors,
+        "diagnostics": diagnostics,
+        "catalog_paths": catalog_paths,
+        "rule_origin": rule_origin,
     }
 
 
