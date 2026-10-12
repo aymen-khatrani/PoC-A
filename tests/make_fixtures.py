@@ -196,31 +196,77 @@ def write_split_heading(path: Path, rows: list[dict[str, str]]) -> None:
     frame.to_excel(path, sheet_name="Exigences", index=False)
 
 
+FRENCH_REQUIREMENTS = [
+    "Le système doit démarrer rapidement et rester convivial "
+    "pour les opérateurs de maintenance.",
+    "Le fournisseur doit livrer la documentation complète avant "
+    "la recette usine, dans les délais contractuels.",
+    "Le dispositif de freinage doit arrêter le train dans une "
+    "distance adaptée aux conditions de la voie.",
+    "Les interfaces doivent être conçues de manière modulaire "
+    "pour faciliter les évolutions ultérieures.",
+    "Le système de supervision doit afficher les alarmes avec "
+    "une priorité appropriée pour chaque situation.",
+]
+
+# Exigences anglaises de style télégraphique. Elles ne contiennent
+# presque aucun mot fonctionnel : la détection de langue doit les
+# reconnaître comme un style d'écriture, pas comme une autre
+# langue.
+TELEGRAPHIC_REQUIREMENTS = [
+    "Cabinet IP65. Weight 45 kg +/- 2 kg.",
+    "Supply 110 VDC nom., range 77-137 VDC per EN 50155.",
+    "MTBF >= 100000 h. MTTR <= 30 min.",
+    "Temp -25/+45 C. Vibration EN 61373 Cat 1 Cl B.",
+    "Noise 68 dBA max. Measurement per ISO 3381.",
+    "CAN 1 Mbit/s. MVB redundant. Latency 50 ms max.",
+    "Enclosure material stainless steel AISI 304.",
+    "Fixing torque 12 Nm. Washer type DIN 125.",
+    "Paint RAL 7035. Thickness 80 micron min.",
+    "Connector type M12 A-coded. Contacts 5.",
+    "Fuse rating 6 A gG. Breaking capacity 50 kA.",
+    "Cable section 2.5 mm2. Insulation EN 50264.",
+]
+
+
 def write_french(path: Path) -> None:
     """Export rédigé en français, pour tester l'avertissement."""
 
     frame = pd.DataFrame(
         [
             {
-                "Identifiant": "FR-001",
-                "Libellé exigence": (
-                    "Le système doit démarrer rapidement et rester "
-                    "convivial pour les opérateurs de maintenance."
-                ),
+                "Identifiant": f"FR-{position:03d}",
+                "Libellé exigence": texte,
                 "Type exigence": "Exigence technique",
-            },
-            {
-                "Identifiant": "FR-002",
-                "Libellé exigence": (
-                    "Le fournisseur doit livrer la documentation "
-                    "complète avant la recette usine."
-                ),
-                "Type exigence": "Exigence contractuelle",
-            },
+            }
+            for position, texte in enumerate(
+                FRENCH_REQUIREMENTS,
+                start=1,
+            )
         ]
     )
 
     frame.to_excel(path, sheet_name="Feuil1", index=False)
+
+
+def write_telegraphic(path: Path) -> None:
+    """Export anglais en style abrégé, sans mots fonctionnels."""
+
+    frame = pd.DataFrame(
+        [
+            {
+                "ID": f"TEL-{position:03d}",
+                "Requirement Text": texte,
+                "ObjectType": "Technical Req",
+            }
+            for position, texte in enumerate(
+                TELEGRAPHIC_REQUIREMENTS,
+                start=1,
+            )
+        ]
+    )
+
+    frame.to_excel(path, sheet_name="Specs", index=False)
 
 
 def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
@@ -264,6 +310,9 @@ def main() -> None:
         rows,
     )
     write_french(FIXTURE_DIRECTORY / "format_francais.xlsx")
+    write_telegraphic(
+        FIXTURE_DIRECTORY / "format_telegraphique.xlsx"
+    )
     write_csv(FIXTURE_DIRECTORY / "format_csv.csv", rows)
 
     for item in sorted(FIXTURE_DIRECTORY.iterdir()):

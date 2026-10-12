@@ -34,7 +34,7 @@ from src.text_utils import (
     classify_object_type,
     clean_value,
     collapse_whitespace,
-    english_stopword_ratio,
+    guess_language_profile,
     is_blank,
     looks_like_heading,
     match_alias,
@@ -839,21 +839,29 @@ def load_requirements(
             "vérifie --include-types et --text-column."
         )
 
-    stopword_ratio = english_stopword_ratio(
+    language = guess_language_profile(
         requirements[CANONICAL_TEXT].head(200).tolist()
         if not requirements.empty
         else []
     )
 
-    if (
-        not requirements.empty
-        and stopword_ratio < config.MINIMUM_ENGLISH_STOPWORD_RATIO
-    ):
+    if language["verdict"] == "other_language":
         warnings.append(
             "Le texte ne semble pas rédigé en anglais "
-            f"(ratio de mots anglais courants : {stopword_ratio:.1%}). "
-            "Le catalogue de règles anglais produira peu "
-            "d'alertes pertinentes."
+            f"({language['other_language_ratio']:.0%} de mots "
+            "fonctionnels d'une autre langue). Le catalogue de "
+            "règles anglais produira peu d'alertes pertinentes."
+        )
+
+    elif language["verdict"] == "telegraphic":
+        # Cas fréquent et parfaitement légitime : des exigences
+        # anglaises rédigées en style abrégé ou sous forme de
+        # valeurs. Ce n'est pas un problème de langue.
+        warnings.append(
+            "Le texte contient très peu de mots fonctionnels "
+            "(style télégraphique ou tabulaire). Les règles "
+            "lexicales auront peu de prise : vérifie que la "
+            "colonne de texte retenue est la bonne."
         )
 
     duplicate_count = int(all_objects["Duplicate_ID"].sum())
@@ -879,7 +887,11 @@ def load_requirements(
         "excluded_rows": int(len(excluded)),
         "generated_ids": int(all_objects["ID_Generated"].sum()),
         "duplicate_ids": duplicate_count,
-        "english_stopword_ratio": round(stopword_ratio, 4),
+        "language_verdict": language["verdict"],
+        "english_stopword_ratio": language["english_ratio"],
+        "other_language_stopword_ratio": language[
+            "other_language_ratio"
+        ],
         "status_counts": all_objects["Import_Status"]
         .value_counts()
         .to_dict(),

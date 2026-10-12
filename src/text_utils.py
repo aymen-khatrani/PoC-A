@@ -259,33 +259,95 @@ def looks_like_heading(text: Any) -> bool:
 # Estimation de la langue
 # ============================================================
 
-def english_stopword_ratio(texts: list[str]) -> float:
-    """
-    Calcule la proportion de mots anglais très courants.
+def count_words(texts: list[str]) -> list[str]:
+    """Extrait les mots alphabétiques d'une liste de textes."""
 
-    Ce test grossier suffit à repérer un export rédigé dans
-    une autre langue, cas dans lequel le catalogue anglais ne
-    produirait aucune alerte utile.
-    """
-
-    total_words = 0
-    stopword_count = 0
+    words: list[str] = []
 
     for text in texts:
-        words = re.findall(
-            r"[a-zA-Z]+",
-            strip_accents(str(text)).lower(),
+        words.extend(
+            re.findall(
+                r"[a-zA-Z]+",
+                strip_accents(str(text)).lower(),
+            )
         )
 
-        total_words += len(words)
+    return words
 
-        stopword_count += sum(
-            1
-            for word in words
-            if word in config.ENGLISH_STOPWORDS
-        )
 
-    if total_words == 0:
+def english_stopword_ratio(texts: list[str]) -> float:
+    """Proportion de mots fonctionnels anglais dans les textes."""
+
+    words = count_words(texts)
+
+    if not words:
         return 0.0
 
-    return stopword_count / total_words
+    return sum(
+        1
+        for word in words
+        if word in config.ENGLISH_STOPWORDS
+    ) / len(words)
+
+
+def other_language_stopword_ratio(texts: list[str]) -> float:
+    """
+    Proportion de mots fonctionnels d'une autre langue
+    européenne courante.
+    """
+
+    words = count_words(texts)
+
+    if not words:
+        return 0.0
+
+    return sum(
+        1
+        for word in words
+        if word in config.OTHER_LANGUAGE_STOPWORDS
+    ) / len(words)
+
+
+def guess_language_profile(texts: list[str]) -> dict[str, object]:
+    """
+    Qualifie le style d'écriture du corpus.
+
+    La version précédente concluait « ce n'est pas de l'anglais »
+    dès que les mots fonctionnels anglais étaient rares. Or des
+    exigences anglaises télégraphiques ou tabulaires, du type
+    « Cabinet IP65. Weight 45 kg +/- 2 kg. », n'en contiennent
+    aucun : l'avertissement se déclenchait à tort.
+
+    Les deux situations sont donc départagées :
+
+        "english"        anglais rédigé, cas normal ;
+        "other_language" mots fonctionnels majoritairement d'une
+                         autre langue, le catalogue anglais est
+                         inopérant ;
+        "telegraphic"    peu de mots fonctionnels, quelle que
+                         soit la langue : les règles lexicales
+                         trouveront peu de prise, mais rien
+                         n'indique une autre langue ;
+        "undetermined"   échantillon trop court pour conclure.
+    """
+
+    words = count_words(texts)
+
+    english_ratio = english_stopword_ratio(texts)
+    other_ratio = other_language_stopword_ratio(texts)
+
+    if len(words) < config.MINIMUM_WORDS_FOR_LANGUAGE_GUESS:
+        verdict = "undetermined"
+    elif english_ratio >= config.MINIMUM_ENGLISH_STOPWORD_RATIO:
+        verdict = "english"
+    elif other_ratio >= config.OTHER_LANGUAGE_STOPWORD_RATIO:
+        verdict = "other_language"
+    else:
+        verdict = "telegraphic"
+
+    return {
+        "verdict": verdict,
+        "word_count": len(words),
+        "english_ratio": round(english_ratio, 4),
+        "other_language_ratio": round(other_ratio, 4),
+    }

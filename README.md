@@ -33,6 +33,7 @@ N'importe quel tableau d'exigences, sans configuration préalable :
 | Identifiants dupliqués | Conservés, analysés et signalés |
 | Export CSV ou texte délimité | Séparateur détecté automatiquement |
 | Texte rédigé dans une autre langue | Analysé, avec avertissement explicite |
+| Style télégraphique ou tabulaire | Analysé, signalé comme style d'écriture et non comme problème de langue |
 
 Formats de fichier : `.xlsx`, `.xlsm`, `.csv`, `.tsv`, `.txt`.
 
@@ -149,9 +150,9 @@ python evaluate.py --help
 |   |-- rules_en.csv         catalogue de 83 règles
 |
 |-- tests/
-|   |-- make_fixtures.py     génère 6 classeurs de test hétérogènes
+|   |-- make_fixtures.py     génère 7 classeurs de test hétérogènes
 |   |-- conftest.py
-|   |-- test_*.py            120 tests
+|   |-- test_*.py            129 tests
 |
 |-- data/input/              fichiers à analyser
 |-- data/output/             rapports produits
@@ -322,14 +323,14 @@ considérés correctement rédigés**, validés par le métier.
 ./.venv/bin/python -m pytest
 ```
 
-120 tests, sans aucun appel réseau : le LLM est testé via un client
+129 tests, sans aucun appel réseau : le LLM est testé via un client
 factice.
 
-Les classeurs de test couvrent six présentations du même contenu
-(DOORS, colonnes renommées avec en-tête décalé, sans identifiant ni
-type, intitulé séparé, CSV à point-virgule, français). Le pipeline
-doit produire le même résultat analytique pour les quatre formats
-équivalents : c'est le test qui garantit la généricité.
+Les classeurs de test couvrent sept présentations (DOORS, colonnes
+renommées avec en-tête décalé, sans identifiant ni type, intitulé
+séparé, CSV à point-virgule, anglais télégraphique, français). Le
+pipeline doit produire le même résultat analytique pour les quatre
+formats équivalents : c'est le test qui garantit la généricité.
 
 Pour régénérer les fixtures :
 
@@ -385,7 +386,7 @@ règles filtrent, le modèle approfondit.
 | Reprise unique | Fonctionnelle |
 | Évaluation précision / rappel / F1 | Fonctionnelle |
 | Rapport Excel | Fonctionnel |
-| Tests automatisés | 120 tests |
+| Tests automatisés | 129 tests |
 | Jeu de référence avec cas négatifs | **À constituer avec le métier** |
 | Interface de validation humaine | À faire |
 | Déploiement partagé | À faire après validation métier |
@@ -412,10 +413,28 @@ clauses » ou « the applicable curve ». Il privilégie la précision
 au rappel. C'est un choix défendable en revue client, mais il doit
 être assumé.
 
-**Langue.** Les règles sont en anglais. Un export en français est
-analysé et un avertissement est émis, mais presque rien ne sera
-détecté. Un catalogue français serait un fichier CSV
-supplémentaire, chargeable via `--rules`.
+**Langue.** Les exigences traitées par ce projet sont en anglais,
+ce qui correspond au catalogue. Le contrôle de langue n'est donc
+pas une limite ici, mais un garde-fou : il signale un export qui
+arriverait dans une autre langue, cas où le catalogue anglais ne
+produirait presque aucune alerte.
+
+Ce contrôle distingue deux situations que l'on confondrait
+facilement :
+
+- **une autre langue** : les mots fonctionnels sont
+  majoritairement non anglais, le catalogue est inopérant ;
+- **de l'anglais télégraphique** : un style abrégé ou tabulaire du
+  type `Cabinet IP65. Weight 45 kg +/- 2 kg.` ne contient presque
+  aucun mot fonctionnel, dans aucune langue. Le texte est bien en
+  anglais, mais les règles lexicales y auront peu de prise. Le
+  message invite alors à vérifier la colonne retenue, sans jamais
+  affirmer que le texte n'est pas en anglais.
+
+Un échantillon de moins de 40 mots ne donne aucun verdict : trop
+court pour conclure. Si un catalogue dans une autre langue devenait
+nécessaire, ce serait un fichier CSV supplémentaire chargé via
+`--rules`.
 
 **Validation humaine hors outil.** Les décisions de l'analyste ne
 sont pas encore saisies dans une interface. C'est le prérequis

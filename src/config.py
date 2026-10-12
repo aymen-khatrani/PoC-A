@@ -250,11 +250,48 @@ ENGLISH_STOPWORDS = {
     "the", "shall", "and", "of", "to", "be", "a", "in", "for",
     "is", "that", "with", "as", "on", "by", "or", "this", "it",
     "all", "any", "from", "at", "which", "are", "not", "if",
+    "must", "should", "when", "where", "each", "its", "their",
+    "has", "have", "been", "will", "may", "than", "then", "such",
 }
 
-# Sous ce ratio de mots anglais courants, un avertissement
-# est ajouté aux diagnostics.
+# Mots fonctionnels d'autres langues européennes probables dans
+# un contexte industriel. Ils servent à distinguer deux cas très
+# différents, que la version précédente confondait :
+#
+#   - un texte rédigé dans une autre langue, pour lequel le
+#     catalogue anglais est inopérant ;
+#   - un texte anglais télégraphique ou tabulaire, qui contient
+#     peu de mots fonctionnels quelle que soit la langue.
+#
+# Le premier cas justifie un avertissement de langue, le second
+# non.
+OTHER_LANGUAGE_STOPWORDS = {
+    # français
+    "le", "la", "les", "des", "du", "une", "doit", "doivent",
+    "dans", "pour", "est", "sont", "avec", "sur", "par", "que",
+    "qui", "au", "aux", "ce", "cette", "etre", "ou",
+    # allemand
+    "der", "die", "das", "und", "muss", "mussen", "soll",
+    "sollen", "mit", "fur", "von", "den", "dem", "ist", "sind",
+    "werden", "nicht", "eine", "einen",
+    # espagnol et italien
+    "el", "los", "las", "una", "debe", "deben", "con", "para",
+    "por", "del", "que", "il", "lo", "gli", "deve", "devono",
+    "della", "delle", "nel", "sono",
+}
+
+# Sous ce ratio de mots fonctionnels anglais, la langue est
+# considérée comme douteuse et les deux cas ci-dessus sont
+# départagés.
 MINIMUM_ENGLISH_STOPWORD_RATIO = 0.04
+
+# Au-dessus de ce ratio de mots fonctionnels d'une autre langue,
+# le texte est signalé comme non anglais.
+OTHER_LANGUAGE_STOPWORD_RATIO = 0.04
+
+# En dessous de ce nombre de mots, aucun verdict de langue n'est
+# émis : l'échantillon est trop court pour conclure.
+MINIMUM_WORDS_FOR_LANGUAGE_GUESS = 40
 
 
 # ============================================================

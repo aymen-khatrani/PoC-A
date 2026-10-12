@@ -123,17 +123,82 @@ class TestFichierSansIdentifiantNiType:
 
 
 class TestDetectionDeLangue:
-    """Un export non anglais doit être signalé, pas refusé."""
+    """
+    Trois situations à ne pas confondre.
 
-    def test_avertissement_langue(self, fixture_directory) -> None:
+    Les exigences réelles de ce projet sont en anglais, souvent
+    en style technique. Un avertissement de langue à tort y
+    serait du bruit trompeur : la distinction est donc testée
+    dans les deux sens.
+    """
+
+    def test_anglais_redige_sans_avertissement(
+        self,
+        fixture_directory,
+    ) -> None:
+        result = load_requirements(
+            fixture_directory / "format_doors.xlsx"
+        )
+
+        assert result["diagnostics"]["language_verdict"] == "english"
+        assert not any(
+            "anglais" in warning or "télégraphique" in warning
+            for warning in result["diagnostics"]["warnings"]
+        )
+
+    def test_anglais_telegraphique_non_signale_comme_autre_langue(
+        self,
+        fixture_directory,
+    ) -> None:
+        result = load_requirements(
+            fixture_directory / "format_telegraphique.xlsx"
+        )
+
+        diagnostics = result["diagnostics"]
+
+        assert diagnostics["language_verdict"] == "telegraphic"
+
+        avertissements = " ".join(diagnostics["warnings"])
+
+        # Le message doit parler de style d'écriture, jamais
+        # affirmer que le texte n'est pas en anglais.
+        assert "télégraphique" in avertissements
+        assert "ne semble pas rédigé en anglais" not in avertissements
+
+    def test_autre_langue_signalee(self, fixture_directory) -> None:
         result = load_requirements(
             fixture_directory / "format_francais.xlsx"
         )
 
-        assert len(result["requirements"]) == 2
+        diagnostics = result["diagnostics"]
+
+        assert diagnostics["language_verdict"] == "other_language"
+        assert len(result["requirements"]) == 5
         assert any(
-            "anglais" in warning
-            for warning in result["diagnostics"]["warnings"]
+            "ne semble pas rédigé en anglais" in warning
+            for warning in diagnostics["warnings"]
+        )
+
+    def test_echantillon_trop_court_aucun_verdict(
+        self,
+        tmp_path,
+    ) -> None:
+        chemin = tmp_path / "court.xlsx"
+
+        pd.DataFrame(
+            {
+                "ID": ["A-1"],
+                "Requirement Text": ["Short statement."],
+                "ObjectType": ["Technical Req"],
+            }
+        ).to_excel(chemin, index=False)
+
+        result = load_requirements(chemin)
+
+        # Conclure sur une seule ligne serait arbitraire.
+        assert (
+            result["diagnostics"]["language_verdict"]
+            == "undetermined"
         )
 
 

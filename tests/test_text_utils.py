@@ -8,6 +8,7 @@ from src.text_utils import (
     clean_value,
     collapse_whitespace,
     english_stopword_ratio,
+    guess_language_profile,
     has_obligation_keyword,
     looks_like_heading,
     match_alias,
@@ -133,3 +134,71 @@ class TestLangue:
 
     def test_texte_vide(self) -> None:
         assert english_stopword_ratio([]) == 0.0
+
+
+class TestProfilDeLangue:
+    """
+    Distinction entre autre langue et anglais abrégé.
+
+    Un ratio faible de mots fonctionnels anglais ne suffit pas à
+    conclure qu'un texte n'est pas en anglais : des exigences
+    techniques du type « Cabinet IP65. Weight 45 kg. » n'en
+    contiennent aucun.
+    """
+
+    def test_anglais_redige(self) -> None:
+        textes = [
+            "The braking system shall stop the train within "
+            "250 m from 80 km/h on dry rails."
+        ] * 4
+
+        assert guess_language_profile(textes)["verdict"] == "english"
+
+    def test_anglais_telegraphique(self) -> None:
+        textes = [
+            "Cabinet IP65. Weight 45 kg +/- 2 kg.",
+            "Supply 110 VDC nom., range 77-137 VDC per EN 50155.",
+            "MTBF >= 100000 h. MTTR <= 30 min.",
+            "Temp -25/+45 C. Vibration EN 61373 Cat 1 Cl B.",
+        ] * 3
+
+        assert (
+            guess_language_profile(textes)["verdict"]
+            == "telegraphic"
+        )
+
+    def test_anglais_avec_acronymes(self) -> None:
+        textes = [
+            "TCMS shall transmit CAN data to the HMI via MVB at "
+            "1 Mbit/s as defined in the interface document."
+        ] * 4
+
+        assert guess_language_profile(textes)["verdict"] == "english"
+
+    def test_francais(self) -> None:
+        textes = [
+            "Le système doit démarrer rapidement et rester "
+            "convivial pour les opérateurs de maintenance."
+        ] * 4
+
+        assert (
+            guess_language_profile(textes)["verdict"]
+            == "other_language"
+        )
+
+    def test_allemand(self) -> None:
+        textes = [
+            "Das System muss innerhalb von 250 m zum Stehen "
+            "kommen und mit der Schnittstelle arbeiten."
+        ] * 4
+
+        assert (
+            guess_language_profile(textes)["verdict"]
+            == "other_language"
+        )
+
+    def test_echantillon_trop_court(self) -> None:
+        assert (
+            guess_language_profile(["Short text."])["verdict"]
+            == "undetermined"
+        )
