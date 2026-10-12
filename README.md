@@ -506,3 +506,4 @@ Le fichier est ouvert dans Excel. Ferme-le puis relance.
 Deux fichiers du catalogue déclarent le même identifiant. Supprime
 le doublon, ou utilise `--non-strict-rules` pour ignorer les règles
 en conflit.
+# PoC-A
