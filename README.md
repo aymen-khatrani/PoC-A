@@ -20,6 +20,39 @@ Humain            ->  décide et valide
 
 ---
 
+## 0. L'outil remplit-il son objectif ?
+
+> Analyser un export de requis client, détecter les exigences
+> ambiguës, non vérifiables ou à formulation risquée, proposer des
+> reformulations soumises à validation humaine, et ouvrir un risque
+> à partager et clarifier avec le client.
+
+Évaluation honnête, point par point :
+
+| Partie de l'objectif | Verdict | Fondement |
+|---|---|---|
+| Analyser un export client | **Oui** | 8 formats hétérogènes testés, colonnes, feuille et en-tête détectés, 0,11 ms par exigence |
+| Détecter ambiguïté, non-vérifiabilité, formulations à risque | **Oui** | 83 règles, 5 axes SMART, singularité, doublons de texte. 100 % de précision et de rappel sur les classeurs de test — mais ces classeurs ont été construits pour l'outil |
+| Proposer des reformulations soumises à validation | **Oui, avec une nuance à connaître** | Voir ci-dessous |
+| Ouvrir un risque à partager avec le client | **Oui** | Page `5. Risques`, brouillon factuel, colonnes de décision à remplir |
+
+**La nuance sur les reformulations.** Sans `--llm`, l'outil ne
+réécrit pas les exigences, et c'est volontaire. Ce que la règle
+fournit est un **patron** : sur `The HMI shall display the alarm
+rapidly`, elle propose `The system shall perform [ACTION TO BE
+DEFINED] within [RESPONSE TIME TO BE CONFIRMED]` — l'acteur et
+l'action du client ont disparu. Réécrire vraiment une exigence
+demande de connaître l'information manquante, et l'inventer serait
+la faute la plus grave que cet outil puisse commettre.
+
+L'outil fait donc les trois choses honnêtes possibles : il montre
+le défaut **dans le texte du client, intact** (texte annoté), il
+formule la **question** à poser, et il propose la **forme**
+attendue. La seule véritable reformulation vient du LLM, et elle
+est présentée comme un brouillon.
+
+---
+
 ## 1. Ce que l'outil accepte en entrée
 
 N'importe quel tableau d'exigences, sans configuration préalable :
@@ -69,6 +102,32 @@ ollama pull qwen2.5:3b
 Le mode règles seules **ne nécessite pas** Ollama ni le paquet
 `ollama` : l'import n'a lieu que si `--llm` est demandé.
 
+### Vérifier l'installation
+
+```bash
+./.venv/bin/python -m pytest -q      # doit afficher 204 passed
+```
+
+Si les classeurs de test manquent, ils se régénèrent :
+
+```bash
+./.venv/bin/python -m tests.make_fixtures
+```
+
+### Porter le projet sur une autre machine
+
+Python 3.10 ou plus récent ; le projet est développé sous 3.14.
+Aucun service, aucune base de données, aucun accès réseau n'est
+requis en mode règles.
+
+| Point d'attention | À savoir |
+|---|---|
+| Répertoire de lancement | `--rules` vaut `rules/` par défaut, chemin relatif. Lancez depuis la racine du projet, ou passez un chemin absolu |
+| Dossier de sortie | `data/output/` est créé automatiquement |
+| Fichier Excel ouvert | L'écriture échoue avec un message explicite : fermez le classeur et relancez |
+| Version de pandas | Bornée à `<4.0` dans `requirements.txt`. Pandas 3 est couvert et testé |
+| Ollama distant | `--host http://adresse:11434` ; le modèle doit être installé sur la machine qui héberge Ollama |
+
 ---
 
 ## 3. Utilisation
@@ -111,10 +170,20 @@ correspondance partielle n'est acceptée qu'en préfixe de mot.
 python run_analysis.py -i export.xlsx --llm --llm-limit 20
 ```
 
-Les exigences sont classées par gravité puis par score qualité
-croissant : les plus douteuses passent en premier. `--llm-limit -1`
+Les exigences à scinder passent en premier, puis les autres par
+gravité et par score qualité croissant : les plus douteuses
+d'abord quand le budget de temps est limité. `--llm-limit -1`
 envoie tout, `--llm-include-clean` envoie aussi les exigences sans
 alerte en revue contextuelle complète.
+
+Un énoncé à scinder est soumis au modèle **même sans constat de
+règle**. Il en était exclu auparavant, faute de constat lexical,
+alors que c'est précisément un défaut de structure que le modèle
+sait décrire et qu'une expression régulière ne voit qu'en partie.
+
+Prévoyez le temps : 26 à 53 s par exigence, en séquentiel. La
+limite par défaut de 20 exigences représente donc environ dix à
+quinze minutes. Les exigences non soumises portent `NOT_RUN`.
 
 ### Mesurer la performance
 
@@ -366,9 +435,82 @@ d'avis ne doit jamais être lue comme un avis favorable.
 
 ---
 
-## 7. Fiabilité de l'analyse LLM
+## 7. Le rôle du LLM
 
-Quatre mécanismes, dans l'ordre où ils agissent :
+### Deux tâches, pas une
+
+Le modèle n'est pas un filtre posé après les règles. Il a deux
+tâches, et la seconde est celle qui justifie sa présence.
+
+**1. Arbitrer les constats des règles.** Pour chaque `rule_id`
+fourni, il décide si le défaut décrit est réellement présent dans
+ce contexte. Une règle est un signal, pas un verdict.
+
+**2. Signaler un défaut qu'aucune règle ne décrit.** C'est le
+champ `additional_findings`. Une règle lexicale ne verra jamais
+qu'une exigence demande de réduire un phénomène sans dire de
+combien, ni qu'une méthode de vérification ne peut pas exister.
+Le modèle, lui, le voit.
+
+```text
+The system shall reduce the vibration level during operation.
+
+Règles seules   : PRE_ANALYSIS_OK · SMART 100 · S:OK M:OK A:OK R:OK T:OK
+                  (aucun mot suspect : aucune règle ne se déclenche)
+
+Après le modèle : CLARIFICATION_REQUIRED · SMART 80 · M:KO
+                  LLM-001 [MEASURABLE, HIGH] « reduce the vibration level »
+                  « The system shall 《reduce the vibration level》 during operation. »
+```
+
+### Le garde-fou : la preuve littérale
+
+Un constat du modèle obéit aux mêmes exigences qu'un constat de
+règle : **il doit citer un passage présent mot pour mot dans
+l'exigence**. La vérification est faite en Python, pas demandée au
+modèle.
+
+| Constat renvoyé | Sort |
+|---|---|
+| preuve retrouvée dans le texte | retenu, identifiant `LLM-001` |
+| `"reduce noise by 50%"` sur un texte qui ne le contient pas | **écarté**, motif tracé |
+| critère qualité inconnu | **écarté**, motif tracé |
+| gravité `CRITICAL` | **écarté** : elle engage le projet et doit venir d'une règle validée par le métier |
+| au-delà de trois constats | **écarté** : au-delà, le modèle ne décrit plus, il commente |
+
+Les motifs d'écartement figurent dans `LLM_Discarded_Findings`.
+C'est ce contrôle qui permet de confier au modèle un rôle de
+détection sans lui confier le droit d'inventer.
+
+### Le verdict tient compte de la revue
+
+Sans cela, l'avis du modèle restait décoratif : les règles
+décidaient du statut, du score et des axes, et le modèle
+commentait à côté. Une exigence dont tous les constats étaient
+jugés infondés gardait un verdict sévère.
+
+Après `apply_model_review`, le verdict affiché est le meilleur
+disponible : constats de règles rejetés par le modèle retirés,
+constats du modèle ajoutés, puis statut, score, axes, action,
+texte annoté et risque **recalculés**.
+
+| Colonne | Contenu |
+|---|---|
+| `Quality_Status`, `SMART_Score`, `SMART_Profile` | Le verdict après revue |
+| `Rule_Quality_Status`, `Rule_SMART_Score`, `Rule_SMART_Profile` | Le verdict des règles seules, conservé pour l'audit |
+| `Source` dans `Rule_Findings` | `RULE` ou `MODEL` : l'origine de chaque constat |
+
+Les exigences non soumises au modèle conservent leur verdict de
+règles, et leurs colonnes d'audit le répètent à l'identique : une
+absence d'avis ne doit jamais ressembler à un avis.
+
+L'action recommandée suit le même principe. Une fausse alerte
+remplace la consigne de correction ; un avis réservé la préfixe
+sans l'effacer ; une absence d'avis ne change rien.
+
+### Fiabilité technique
+
+Cinq mécanismes, dans l'ordre où ils agissent :
 
 **1. Constats dédupliqués avant l'appel.** Les occurrences sont
 regroupées par `rule_id`, avec leurs preuves en liste. Envoyer deux
@@ -391,6 +533,13 @@ confirmait le problème.
 lancée avec `temperature` à 0, `num_predict` augmenté de 30 % et
 `repeat_penalty` à 1.15. Jamais plus d'une reprise, jamais de
 boucle. La réponse brute est conservée dans le rapport.
+
+**5. Schéma transmis une seule fois.** Il était à la fois imposé
+via `format` et recopié dans le prompt : près d'un cinquième du
+prompt pour rien, soit 1 456 caractères par appel, sur une fenêtre
+de contexte précieuse pour un modèle local. Il n'est désormais
+rappelé dans le prompt qu'en mode de repli, quand la grammaire de
+sortie n'est pas imposée.
 
 ### Prompt indépendant du domaine
 
@@ -671,4 +820,126 @@ Le fichier est ouvert dans Excel. Ferme-le puis relance.
 Deux fichiers du catalogue déclarent le même identifiant. Supprime
 le doublon, ou utilise `--non-strict-rules` pour ignorer les règles
 en conflit.
+
+---
+
+## 15. Journal des évolutions
+
+### Refonte SMART, singularité et sortie hiérarchisée
+
+**Objectif de la passe.** Évaluer chaque exigence sur les cinq axes
+SMART, faire respecter le principe de singularité — un énoncé, une
+exigence — et rendre la première page du rapport lisible sans
+formation préalable.
+
+#### Ce qui a été ajouté
+
+**Grille SMART portée par le catalogue.** Une colonne facultative
+`smart_dimension` déclare l'axe qu'une règle met en défaut ; vide,
+l'axe est déduit de la catégorie. Ajouter une règle ne demande donc
+aucune modification de code. Répartition obtenue : 37 règles
+`SPECIFIC`, 16 `MEASURABLE`, 10 `TIME_BOUND`, 9 `ACHIEVABLE`,
+9 `RELEVANT`, 2 `SINGULARITY`.
+
+**Contrôle de singularité.** Détection structurelle, avec deux
+garde-fous qui ont chacun corrigé un comportement mesuré :
+
+```text
+"...clause 7.2, which states that the equipment must be painted."
+   avant : TO_SPLIT n=2 + statut relevé à tort
+   après : UNIQUE              (obligation citée, pas une exigence de plus)
+
+"The system shall log X and the HMI shall display Y."
+   après : TO_SPLIT n=2        (inchangé : deux obligations réelles)
+
+"The system shall log X and the operator must confirm."
+   après : TO_CHECK            (modaux mêlés : prudence)
+```
+
+**Rapport en cinq pages de lecture.** La synthèse s'ouvre sur
+deux colonnes, sans filtre ni quadrillage, et annonce ce qui a été
+écarté avant d'annoncer ce qui a été analysé. Les pages
+`4. Questions client` et `5. Risques` sont les livrables : elles
+se terminent par des colonnes de décision vides, trace de la
+validation humaine.
+
+**Texte annoté.** La seule « reformulation » que le moteur puisse
+produire honnêtement : le texte du client, intact, avec les
+passages détectés encadrés.
+
+```text
+《The interface shall be》 《robust》 and handle errors 《appropriately》, 《if necessary》.
+```
+
+**Doublons de texte dans le lot.** Deux identifiants distincts qui
+portent la même exigence : `IDENTICAL` après normalisation,
+`SIMILAR` par signature de mots. Le statut est relevé à
+`REVIEW_REQUIRED`, car corriger deux fois le même texte est du
+travail perdu.
+
+**Le LLM promu d'arbitre à détecteur.** Voir la section 7. Le
+modèle peut ajouter des constats, à condition de citer un passage
+présent mot pour mot dans l'exigence ; son avis recalcule le
+statut, le score, les axes, l'action et le risque, et le verdict
+des règles seules est conservé pour l'audit.
+
+#### Deux bugs trouvés en route
+
+**Troncature Excel inopérante.** `prepare_frame_for_excel` testait
+`series.dtype == object`. Sous pandas 3, une colonne de texte porte
+le dtype `str` : la condition ne se déclenchait plus, la troncature
+explicite à 32 000 caractères ne s'exécutait pas, et openpyxl
+coupait silencieusement à 32 767 **sans la mention** « texte
+tronqué ». Le lecteur ne pouvait pas savoir que le texte était
+coupé. Le test porte désormais sur les valeurs, et non sur le
+dtype.
+
+**Aperçu console aveugle.** Il filtrait sur `Issue_Count > 0` et
+passait donc à côté des exigences à scinder et des doublons, qui ne
+déclenchent aucune règle lexicale. Sur le classeur de test dédié,
+l'aperçu affichait 1 cas au lieu de 4. Le filtre porte maintenant
+sur le statut.
+
+#### Fichiers touchés
+
+| Fichier | Nature |
+|---|---|
+| `src/smart_evaluator.py` | **créé** — axes SMART et singularité, sans dépendance à pandas ni à Excel |
+| `src/config.py` | axes, verdicts, libellés français et anglais, seuils de singularité, doublons, avis et constats du modèle |
+| `src/reporting.py` | cinq pages de tête, mise en forme de synthèse, palettes dérivées |
+| `src/rule_engine.py` | axe par constat, origine `Source`, texte annoté, risque enrichi, doublons de lot, `summarise_requirement` et `rebuild_findings` extraits |
+| `src/llm_analyzer.py` | constats ajoutés par le modèle, `apply_model_review`, action réconciliée, prompt allégé |
+| `src/rule_loader.py` | colonne `smart_dimension`, validation, axes dans les diagnostics |
+| `src/text_utils.py` | `join_unique` et `unique_preserve_order` déplacés ici, pour que `reporting` n'importe pas le moteur |
+| `rules/rules_en.csv` | colonne `smart_dimension`, 11 règles à axe explicite |
+| `run_analysis.py` | nouvelles feuilles, console en libellés lisibles, aperçu corrigé |
+| `evaluate.py` | imports morts retirés |
+| `tests/` | `test_reporting.py` et `test_smart_evaluator.py` créés, fixture `format_singularite.xlsx` ajoutée, `test_pipeline.py` et `test_rule_loader.py` étendus |
+
+**Volume** : environ 1 490 lignes de code et 1 420 lignes de tests.
+Tests : 129 → **204**. `pyflakes` ne signale plus rien.
+Performance inchangée : 0,11 ms par exigence sur 2 000 exigences.
+
+#### Ce qui reste ouvert
+
+Deux leviers de performance sur le LLM, non entamés :
+
+1. **Parallélisme.** `analyze_batch` boucle en séquentiel, un appel
+   bloquant par exigence. Ollama sert plusieurs requêtes en
+   parallèle : un pool de quatre workers diviserait le temps mural
+   par trois à quatre, et ferait passer `--llm-limit` de 20 à 100
+   sans changer la patience de l'utilisateur.
+2. **Cache disque.** Relancer la même analyse réinterroge le
+   modèle sur chaque exigence. Une clé
+   `sha256(modèle + options + prompt)` rendrait la seconde passe
+   immédiate, et les doublons de texte gratuits.
+
+Sur le fond, trois manques connus et documentés en section 12 :
+l'axe `RELEVANT` reste structurellement optimiste, les doublons
+sémantiques ne sont pas détectés, et aucune analyse de cohérence
+entre exigences n'existe. `evaluate.py` ne mesure toujours que le
+binaire signalé / non signalé, pas la justesse des axes.
+
+---
+
 # PoC-A
