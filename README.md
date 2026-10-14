@@ -3,6 +3,9 @@
 Analyse la qualité rédactionnelle d'un export d'exigences client
 et produit un rapport Excel exploitable en revue.
 
+Chaque exigence est évaluée sur les cinq axes **SMART** et sur le
+principe de **singularité** : un énoncé, une exigence.
+
 L'outil combine trois niveaux, dans cet ordre de responsabilité :
 
 ```text
@@ -76,7 +79,9 @@ Le mode règles seules **ne nécessite pas** Ollama ni le paquet
 python run_analysis.py -i mon_export.xlsx
 ```
 
-Le rapport est écrit dans `data/output/` avec un horodatage.
+Le rapport est écrit dans `data/output/` avec un horodatage. Il
+s'ouvre sur la page `1. Synthese`, qui tient en un écran ; le
+détail suit dans les pages suivantes.
 
 ### Forcer une colonne mal détectée
 
@@ -143,6 +148,7 @@ python evaluate.py --help
 |   |-- excel_loader.py      import génerique d'un fichier client
 |   |-- rule_loader.py       chargement et validation du catalogue
 |   |-- rule_engine.py       application des règles, score, risque
+|   |-- smart_evaluator.py   axes SMART et singularité de l'exigence
 |   |-- llm_analyzer.py      analyse contextuelle Ollama
 |   |-- reporting.py         écriture et mise en forme des rapports
 |
@@ -150,9 +156,9 @@ python evaluate.py --help
 |   |-- rules_en.csv         catalogue de 83 règles
 |
 |-- tests/
-|   |-- make_fixtures.py     génère 7 classeurs de test hétérogènes
+|   |-- make_fixtures.py     génère 8 classeurs de test hétérogènes
 |   |-- conftest.py
-|   |-- test_*.py            129 tests
+|   |-- test_*.py            204 tests
 |
 |-- data/input/              fichiers à analyser
 |-- data/output/             rapports produits
@@ -166,12 +172,20 @@ colonne n'est codé en dur ailleurs.
 
 ## 5. Catalogue de règles
 
-`rules/rules_en.csv`, 8 colonnes :
+`rules/rules_en.csv`, 8 colonnes obligatoires et 1 facultative :
 
 ```text
 rule_id, category, pattern, severity, explanation,
-clarification_question, rewrite_template, enabled
+clarification_question, rewrite_template, enabled,
+smart_dimension
 ```
+
+`smart_dimension` déclare l'axe SMART mis en défaut par la règle :
+`SPECIFIC`, `MEASURABLE`, `ACHIEVABLE`, `RELEVANT`, `TIME_BOUND`
+ou `SINGULARITY`. Laissée vide, ou absente du fichier, elle est
+déduite de la catégorie via `CATEGORY_TO_SMART_DIMENSION` dans
+`src/config.py`. Une règle nouvelle est donc toujours rattachée à
+un axe, sans modifier le code.
 
 Catégories : `AMBIGUITY`, `NOT_VERIFIABLE`, `INCOMPLETE`,
 `UNDEFINED_CONDITION`, `UNDEFINED_REFERENCE`, `UNDEFINED_QUANTITY`,
@@ -201,6 +215,118 @@ non-conformité.
 
 ## 6. Interprétation du rapport
 
+Le rapport est hiérarchisé : les trois premières feuilles sont
+faites pour être lues, les suivantes pour être auditées. Rien
+n'est supprimé, tout est rangé.
+
+| Feuille | Pour qui | Contenu |
+|---|---|---|
+| `1. Synthese` | tout le monde | Le bilan du lot en une page : ce qui a été lu, **ce qui a été écarté**, ce que vaut le lot, où il pèche, comment lire la suite |
+| `2. Exigences` | l'ingénieur | Une ligne par exigence, triée par priorité : texte, verdict, profil SMART, unicité, action attendue |
+| `3. Detail SMART` | l'ingénieur | Une ligne par couple exigence / axe en défaut : preuve, question à poser, patron de reformulation |
+| `4. Questions client` | le client, après validation | Les questions à poser, le texte du client avec les passages en cause encadrés, et trois colonnes vides pour tracer la validation humaine |
+| `5. Risques` | le responsable exigences | Les brouillons de risque à ouvrir, avec les axes en défaut et les colonnes de décision |
+
+La page de synthèse ne contient aucun identifiant d'exigence,
+aucune preuve brute et aucune constante technique : c'est une page
+de décision, pas une page de données. Elle annonce aussi le
+nombre de lignes lues et écartées, les identifiants générés ou
+dupliqués et les avertissements d'import : un rapport qui annonce
+huit exigences sans dire que le fichier en contenait dix ne permet
+pas de juger du périmètre analysé.
+
+### Ce que l'outil propose, et ce qu'il ne propose pas
+
+C'est la distinction la plus importante du rapport.
+
+| Colonne | Ce que c'est |
+|---|---|
+| `Texte du client (passages en cause encadrés)` | **Le texte du client, intact**, avec les passages détectés encadrés par `《 》`. Aucun mot ajouté, retiré ou déplacé. |
+| `Patron de reformulation` | Un **patron** issu de la règle, pas une réécriture de l'exigence. Il montre la forme attendue, avec des marqueurs à compléter. |
+| `Reformulation du modèle` | La seule véritable reformulation, produite par le LLM quand il est activé. Brouillon soumis à validation. |
+| `Questions à poser` | Les questions de clarification, directement envoyables au client après validation. |
+| `Brouillon de risque` | Un risque factuel : axes en défaut, passages relevés, verdict d'unicité. Aucun seuil, coût ni délai inventé. |
+
+Sans `--llm`, l'outil ne réécrit donc pas les exigences : il montre
+précisément où le défaut se trouve, formule la question à poser, et
+propose la forme attendue. C'est volontaire : réécrire une exigence
+demande de connaître l'information manquante, et l'inventer serait
+la faute la plus grave que cet outil puisse commettre.
+
+### Doublons de texte
+
+Le chargeur signale les **identifiants** dupliqués. Le moteur
+signale le cas inverse, plus coûteux en revue : deux identifiants
+distincts qui portent la même exigence.
+
+| `Duplicate_Status` | Détection |
+|---|---|
+| `IDENTICAL` | textes identiques après normalisation de la casse, des accents, de la ponctuation et des espaces |
+| `SIMILAR` | même ensemble de mots dans un ordre différent, au-delà de six mots significatifs |
+
+Aucune exigence n'est désignée comme l'originale : les membres d'un
+groupe se citent mutuellement, et le choix de celle à conserver
+revient à l'ingénieur. Le statut d'un doublon est relevé à
+`REVIEW_REQUIRED` : corriger deux fois le même texte est du travail
+perdu.
+
+### La grille SMART
+
+Les cinq axes pèsent le même poids, vingt points chacun, pour un
+score de 0 à 100 :
+
+| Axe | Question posée | Catégories de règles rattachées |
+|---|---|---|
+| **S** Spécifique | Un acteur, une action, un objet, sans ambiguïté ? | `AMBIGUITY`, `MISSING_ACTOR`, `UNDEFINED_REFERENCE`, `UNDEFINED_CONDITION` |
+| **M** Mesurable | Un résultat quantifié et vérifiable par un essai ? | `NOT_VERIFIABLE`, `UNDEFINED_QUANTITY`, `MISSING_UNIT_OR_LIMIT`, `MISSING_TOLERANCE`, `MISSING_VERIFICATION_CRITERIA` |
+| **A** Atteignable | Une obligation ferme et techniquement tenable ? | `WEAK_OBLIGATION`, objectifs absolus |
+| **R** Pertinente | Une exigence complète, rattachable à un besoin ? | `INCOMPLETE` |
+| **T** Temporellement définie | Un délai, une durée ou une fréquence chiffrés ? | règles de délai déclarées `TIME_BOUND` |
+
+Le verdict d'un axe vient de la gravité la plus élevée constatée
+sur cet axe : `HIGH` ou `CRITICAL` donnent `NOT_MET` (0 point),
+`MEDIUM` ou `LOW` donnent `TO_CHECK` (10 points), l'absence de
+constat donne `OK` (20 points).
+
+Un axe `OK` signifie que le catalogue déterministe n'a rien trouvé
+à reprocher à l'exigence sur cet axe. Ce n'est pas un satisfecit :
+la revue d'ingénierie reste requise, et la synthèse le dit.
+
+### La singularité
+
+Une exigence doit exprimer **une seule obligation**. Deux
+obligations dans un même énoncé rendent la vérification partielle
+impossible à tracer : l'une peut être satisfaite et l'autre non,
+sans qu'aucun statut ne puisse le dire.
+
+| Verdict | Déclenché par |
+|---|---|
+| `TO_SPLIT` | plusieurs verbes d'obligation **de même forme**, ou une énumération à puces ou numérotée |
+| `TO_CHECK` | des verbes d'obligation de formes différentes, un connecteur additif, un chapelet de points-virgules, ou un constat `POTENTIALLY_NON_ATOMIC` |
+| `UNIQUE` | aucun de ces signaux |
+
+Deux garde-fous évitent de condamner une exigence correcte :
+
+- **une obligation citée n'est pas une exigence de plus.** Dans
+  `The supplier shall comply with clause 7.2, which states that the
+  equipment must be painted.`, le `must` rappelle une obligation
+  définie ailleurs. Les marqueurs de citation sont listés dans
+  `SINGULARITY_CITATION_PATTERN` ;
+- **des modaux mêlés appellent la prudence.** `shall` puis `must`
+  dans un même énoncé trahissent plus souvent une citation ou un
+  style mélangé que deux exigences : le verdict reste `TO_CHECK`.
+
+Les seuils sont regroupés dans `SingularitySettings`
+(`src/config.py`) et peuvent être resserrés sans toucher au code.
+
+La singularité n'entre pas dans le score SMART : elle ne qualifie
+pas la rédaction, elle dit combien d'exigences l'énoncé contient.
+En revanche, une exigence `TO_SPLIT` ne peut pas rester
+`PRE_ANALYSIS_OK` : son statut est relevé à `REVIEW_REQUIRED`.
+
+Le découpage n'est jamais fait à la place de l'ingénieur. L'outil
+compte, prouve, et demande.
+
 ### Feuille `Analysis_Results`
 
 Une ligne par exigence.
@@ -209,6 +335,12 @@ Une ligne par exigence.
 |---|---|
 | `Quality_Status` | `PRE_ANALYSIS_OK`, `REVIEW_RECOMMENDED`, `REVIEW_REQUIRED`, `CLARIFICATION_REQUIRED`, `NOT_ANALYSED` |
 | `Quality_Score` | 0 à 100, pénalisé **une seule fois par règle** |
+| `SMART_Score` | 0 à 100, vingt points par axe |
+| `SMART_Profile` | Les cinq axes en une colonne, par exemple `S:OK M:KO A:OK R:OK T:?` |
+| `SMART_Specific` … `SMART_Time_Bound` | Verdict de chaque axe : `OK`, `TO_CHECK`, `NOT_MET`, `NOT_ASSESSED` |
+| `Singularity_Status` | `UNIQUE`, `TO_CHECK`, `TO_SPLIT`, `NOT_ASSESSED` |
+| `Estimated_Requirement_Count` | Nombre d'exigences que l'énoncé semble contenir |
+| `Recommended_Action` | L'action attendue, en une phrase |
 | `Issue_Count` | Nombre de règles distinctes déclenchées |
 | `Occurrence_Count` | Nombre total de correspondances |
 | `Evidence` | Passages exacts qui ont déclenché les règles |
@@ -226,7 +358,7 @@ d'avis ne doit jamais être lue comme un avis favorable.
 
 | Feuille | Contenu |
 |---|---|
-| `Rule_Findings` | Une ligne par occurrence, avec preuve et position |
+| `Rule_Findings` | Une ligne par occurrence, avec preuve, position et axe SMART |
 | `Excluded_Rows` | Toute ligne non analysée, avec son motif |
 | `Diagnostics` | Import, catalogue, moteur, LLM |
 | `Run_Information` | Fichiers, colonnes retenues, modèle, durée |
@@ -381,14 +513,21 @@ règles filtrent, le modèle approfondit.
 | Catalogue multi-fichiers | Fonctionnel |
 | Moteur déterministe | Fonctionnel |
 | Score et statuts qualité | Fonctionnels, seuils réglables |
+| Évaluation SMART par axe | Fonctionnelle, axes déclarés dans le catalogue |
+| Contrôle de singularité | Fonctionnel, détection structurelle |
+| Rapport hiérarchisé en pages de lecture | Fonctionnel |
+| Doublons de texte dans le lot | Fonctionnel, exact et par signature de mots |
+| Page de questions client avec validation | Fonctionnelle |
+| Page de risques avec validation | Fonctionnelle |
+| Avis du modèle réconcilié avec l'action | Fonctionnel |
 | Analyse LLM intégrée au pipeline | Fonctionnelle |
 | Sortie JSON contrainte par schéma | Fonctionnelle |
 | Reprise unique | Fonctionnelle |
 | Évaluation précision / rappel / F1 | Fonctionnelle |
 | Rapport Excel | Fonctionnel |
-| Tests automatisés | 129 tests |
+| Tests automatisés | 204 tests |
 | Jeu de référence avec cas négatifs | **À constituer avec le métier** |
-| Interface de validation humaine | À faire |
+| Interface de validation humaine | Colonnes de validation dans le rapport ; outil dédié à faire |
 | Déploiement partagé | À faire après validation métier |
 | RAG | Hors périmètre |
 
@@ -413,6 +552,28 @@ clauses » ou « the applicable curve ». Il privilégie la précision
 au rappel. C'est un choix défendable en revue client, mais il doit
 être assumé.
 
+**Portée de la grille SMART.** Un axe est déclaré conforme quand
+aucune règle ne s'est déclenchée sur lui. L'axe **R**, en
+particulier, ne peut pas être établi par une analyse lexicale : la
+pertinence d'une exigence se juge par rapport à un besoin, à une
+exigence parente et à un périmètre contractuel, qui ne figurent pas
+dans le texte analysé. L'outil n'y signale donc que
+l'incomplétude déclarée, du type `TBD`.
+
+**Portée du contrôle de singularité.** La détection est
+structurelle : verbes d'obligation, énumérations, connecteurs
+additifs. Deux obligations rédigées sans verbe répété, par exemple
+« the system shall log and notify », ne sont vues qu'au titre des
+règles `POTENTIALLY_NON_ATOMIC`, et seulement signalées comme « à
+vérifier ». Le verdict est un signal de revue : le découpage reste
+une décision d'ingénierie.
+
+**Portée de la détection de doublons.** Elle repose sur deux
+signatures, le texte normalisé et l'ensemble des mots. Deux
+exigences qui disent la même chose avec des mots différents ne
+sont pas détectées : il faudrait une comparaison sémantique, donc
+le LLM ou un modèle d'embeddings.
+
 **Langue.** Les exigences traitées par ce projet sont en anglais,
 ce qui correspond au catalogue. Le contrôle de langue n'est donc
 pas une limite ici, mais un garde-fou : il signale un export qui
@@ -436,9 +597,13 @@ court pour conclure. Si un catalogue dans une autre langue devenait
 nécessaire, ce serait un fichier CSV supplémentaire chargé via
 `--rules`.
 
-**Validation humaine hors outil.** Les décisions de l'analyste ne
-sont pas encore saisies dans une interface. C'est le prérequis
-avant tout usage opérationnel.
+**Validation humaine dans le classeur.** Les pages
+`4. Questions client` et `5. Risques` portent des colonnes de
+décision vides, à remplir à la main : c'est la trace de la
+validation, et elle suffit à travailler. Mais rien ne la rend
+obligatoire, rien ne la relit et rien ne la conserve d'une
+analyse à la suivante. Une interface dédiée reste le prérequis
+d'un usage opérationnel à l'échelle.
 
 ---
 

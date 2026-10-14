@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -32,12 +31,21 @@ import pandas as pd
 from src import config
 from src.config import (
     CANONICAL_ID,
-    CANONICAL_TEXT,
     EngineSettings,
     LoaderSettings,
 )
 from src.excel_loader import display_diagnostics, load_requirements
 from src.reporting import (
+    OVERVIEW_SHEET_NAME,
+    QUESTIONS_SHEET_NAME,
+    REQUIREMENTS_SHEET_NAME,
+    RISKS_SHEET_NAME,
+    SMART_DETAIL_SHEET_NAME,
+    build_overview_frame,
+    build_questions_frame,
+    build_requirements_frame,
+    build_risks_frame,
+    build_smart_detail_frame,
     diagnostics_to_frame,
     rules_to_frame,
     write_report,
@@ -303,9 +311,44 @@ def display_engine_diagnostics(diagnostics: dict[str, Any]) -> None:
         f"({diagnostics['average_time_ms']} ms par exigence)"
     )
 
+    print(
+        f"Score SMART moyen          : "
+        f"{diagnostics['average_smart_score']}"
+        f"/{config.SMART_MAXIMUM_SCORE}"
+    )
+    print(
+        f"Conformes sur les 5 axes   : "
+        f"{diagnostics['fully_smart_count']}"
+    )
+    print(
+        f"Exigences à scinder        : "
+        f"{diagnostics['requirements_to_split']}"
+    )
+    print(
+        f"Exigences au texte répété  : "
+        f"{diagnostics['duplicate_text_count']}"
+    )
+
     print("\nRépartition des statuts :")
     for status, count in diagnostics["status_counts"].items():
-        print(f"  - {status}: {count}")
+        print(
+            f"  - {config.STATUS_LABELS.get(status, status)}: "
+            f"{count}"
+        )
+
+    print("\nAxes SMART en défaut :")
+    for label, count in diagnostics[
+        "smart_axis_not_met_counts"
+    ].items():
+        to_check = diagnostics["smart_axis_to_check_counts"].get(
+            label,
+            0,
+        )
+
+        print(
+            f"  - {label}: {count} non conformes, "
+            f"{to_check} à vérifier"
+        )
 
     if diagnostics["category_counts"]:
         print("\nPrincipales catégories de défauts :")
@@ -326,27 +369,56 @@ def display_sample(summary: pd.DataFrame, limit: int) -> None:
     if limit <= 0 or summary.empty:
         return
 
-    flagged = summary[summary["Issue_Count"] > 0]
+    # Un énoncé à scinder, ou répété ailleurs dans le lot, peut
+    # ne déclencher aucune règle lexicale. Le critère est donc
+    # le statut, et non le nombre de constats : sinon l'aperçu
+    # passerait à côté du travail le plus urgent.
+    flagged = summary[
+        summary["Quality_Status"] != config.STATUS_PRE_ANALYSIS_OK
+    ]
 
     if flagged.empty:
         print("\nAucune alerte sur ce fichier.")
         return
 
-    print_section(f"APERÇU DES {min(limit, len(flagged))} CAS PRIORITAIRES")
+    count = min(limit, len(flagged))
+
+    print_section(
+        f"APERÇU DE {count} CAS PRIORITAIRE"
+        if count == 1
+        else f"APERÇU DES {count} CAS PRIORITAIRES"
+    )
+
+    apercu = flagged.sort_values("SMART_Score").head(limit).copy()
+
+    # Les constantes techniques restent dans le rapport ; la
+    # console affiche les libellés lus en revue.
+    apercu["Quality_Status"] = apercu["Quality_Status"].map(
+        lambda status: config.STATUS_LABELS.get(status, status)
+    )
+    apercu["Singularity_Status"] = apercu[
+        "Singularity_Status"
+    ].map(
+        lambda status: config.SINGULARITY_LABELS.get(
+            status,
+            status,
+        )
+    )
 
     columns = [
         CANONICAL_ID,
         "Quality_Status",
-        "Quality_Score",
-        "Issue_Count",
-        "Triggered_Rules",
-        "Evidence",
+        "SMART_Score",
+        "SMART_Profile",
+        "Singularity_Status",
+        "Recommended_Action",
     ]
 
     print(
-        flagged.sort_values("Quality_Score")[columns]
-        .head(limit)
-        .to_string(index=False, max_colwidth=45)
+        apercu[columns].to_string(
+            index=False,
+            max_colwidth=45,
+        )
     )
 
 
@@ -465,6 +537,7 @@ def run_pipeline(arguments: argparse.Namespace) -> dict[str, Any]:
         from src.llm_analyzer import (
             LLMSettings,
             analyze_batch,
+            apply_model_review,
             display_llm_diagnostics,
             merge_llm_results,
             select_llm_candidates,
@@ -507,8 +580,31 @@ def run_pipeline(arguments: argparse.Namespace) -> dict[str, Any]:
                 llm_frame=llm_result["dataframe"],
             )
 
+            # La revue du modèle entre dans le verdict : ses
+            # constats rejetés sont retirés, ceux qu'il a
+            # ajoutés sont pris en compte. Le verdict issu des
+            # seules règles reste dans les colonnes Rule_*.
+            review = apply_model_review(
+                summary_frame=summary,
+                findings_frame=findings,
+                engine_settings=EngineSettings(),
+            )
+
+            summary = review["summary"]
+            findings = review["findings"]
+
             llm_diagnostics.update(llm_result["diagnostics"])
+            llm_diagnostics.update(review["diagnostics"])
             llm_diagnostics["selected_count"] = len(candidates)
+
+            print(
+                "Constats ajoutés par le modèle : "
+                f"{review['diagnostics']['added_finding_count']}"
+            )
+            print(
+                "Constats écartés par le modèle : "
+                f"{review['diagnostics']['dropped_finding_count']}"
+            )
 
     # ------------------------------------------------------
     # 5. Aperçu et rapport
@@ -575,9 +671,50 @@ def run_pipeline(arguments: argparse.Namespace) -> dict[str, Any]:
         ignore_index=True,
     )
 
+    # Les trois premières feuilles sont faites pour être lues :
+    # le bilan, puis une ligne par exigence, puis le détail par
+    # axe. Les feuilles techniques suivent, inchangées, pour
+    # l'audit et la reprise des données.
+    overview_frame = build_overview_frame(
+        summary_frame=summary,
+        diagnostics=analysis_result["diagnostics"],
+        import_diagnostics=excel_result["diagnostics"],
+        llm_diagnostics=llm_diagnostics,
+        context_rows=[
+            ("Fichier analysé", input_path.name),
+            (
+                "Feuille",
+                excel_result["diagnostics"]["sheet_name"],
+            ),
+            (
+                "Date d'analyse",
+                datetime.now().strftime("%d/%m/%Y %H:%M"),
+            ),
+            ("Règles appliquées", len(rules)),
+            (
+                "Analyse contextuelle LLM",
+                arguments.model if arguments.llm else "non activée",
+            ),
+        ],
+    )
+
     write_report(
         output_path=output_path,
         sheets={
+            OVERVIEW_SHEET_NAME: overview_frame,
+            REQUIREMENTS_SHEET_NAME: build_requirements_frame(
+                summary_frame=summary,
+            ),
+            SMART_DETAIL_SHEET_NAME: build_smart_detail_frame(
+                summary_frame=summary,
+                findings_frame=findings,
+            ),
+            QUESTIONS_SHEET_NAME: build_questions_frame(
+                summary_frame=summary,
+            ),
+            RISKS_SHEET_NAME: build_risks_frame(
+                summary_frame=summary,
+            ),
             "Analysis_Results": summary,
             "Rule_Findings": findings,
             "Excluded_Rows": excel_result["excluded"],
@@ -587,6 +724,7 @@ def run_pipeline(arguments: argparse.Namespace) -> dict[str, Any]:
                 rules_result["all_valid_rules"]
             ),
         },
+        overview_sheets=[OVERVIEW_SHEET_NAME],
     )
 
     print(f"Rapport écrit              : {output_path}")

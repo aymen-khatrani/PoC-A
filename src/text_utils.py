@@ -70,7 +70,11 @@ def strip_accents(text: str) -> str:
 
 def normalize_key(value: Any) -> str:
     """
-    Produit une clé de comparaison pour un nom de colonne.
+    Produit une clé de comparaison insensible à la forme.
+
+    Elle sert à reconnaître un nom de colonne quelle que soit
+    son écriture, et à comparer deux textes d'exigence sans se
+    laisser tromper par la ponctuation ou la casse.
 
     Exemple :
         " Object  Heading & Object_Text " devient
@@ -253,6 +257,32 @@ def looks_like_heading(text: Any) -> bool:
         return True
 
     return False
+
+
+# ============================================================
+# Assemblage de listes lisibles
+# ============================================================
+
+def unique_preserve_order(values: list[Any]) -> list[str]:
+    """Supprime les doublons en conservant l'ordre d'apparition."""
+
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for value in values:
+        cleaned = clean_value(value)
+
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+
+    return result
+
+
+def join_unique(values: list[Any], separator: str = " | ") -> str:
+    """Assemble des valeurs uniques en une chaîne lisible."""
+
+    return separator.join(unique_preserve_order(values))
 
 
 # ============================================================

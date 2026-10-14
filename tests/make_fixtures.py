@@ -269,6 +269,61 @@ def write_telegraphic(path: Path) -> None:
     frame.to_excel(path, sheet_name="Specs", index=False)
 
 
+# Exigences ciblant la singularité et les doublons de texte.
+# Elles ne sont pas mélangées aux autres fixtures : les tests
+# existants comptent les exigences et les alertes du jeu
+# principal, et doivent rester stables.
+SINGULARITY_REQUIREMENTS = [
+    # Deux obligations de même forme : à scinder.
+    "The system shall display the train speed and the "
+    "controller shall log every door event.",
+    # Énumération rassemblée dans une seule ligne : à scinder.
+    "The gateway shall support:\n"
+    "- Ethernet\n"
+    "- CAN bus\n"
+    "- serial link",
+    # Obligation citée depuis un autre document : exigence
+    # unique, malgré la présence de deux verbes d'obligation.
+    "The supplier shall comply with clause 7.2, which states "
+    "that the equipment must be painted.",
+    # Exigence correcte, sans aucun défaut attendu.
+    "The door shall close within 3 s after the close command "
+    "is received, verified by test procedure TP-21.",
+    # Même texte que la précédente, à la ponctuation près :
+    # doublon de texte.
+    "The door shall close within 3 s after the close command is "
+    "received, verified by test procedure TP-21!",
+    # Texte vide : exigence non analysable.
+    "",
+]
+
+
+def write_singularity(path: Path) -> None:
+    """
+    Export dédié à la singularité, aux doublons et au texte vide.
+
+    Ces trois cas ne figurent dans aucune autre fixture, alors
+    qu'ils déclenchent l'escalade de statut, la détection de
+    doublon et le verdict « non évalué ».
+    """
+
+    frame = pd.DataFrame(
+        [
+            {
+                "ID": f"SING-{position:03d}",
+                "Requirement Text": texte,
+                "ObjectType": "Technical Req",
+            }
+            for position, texte in enumerate(
+                SINGULARITY_REQUIREMENTS,
+                start=1,
+            )
+        ]
+    )
+
+    frame.to_excel(path, sheet_name="Specs", index=False)
+
+
 def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     """Export CSV avec point-virgule."""
 
@@ -312,6 +367,9 @@ def main() -> None:
     write_french(FIXTURE_DIRECTORY / "format_francais.xlsx")
     write_telegraphic(
         FIXTURE_DIRECTORY / "format_telegraphique.xlsx"
+    )
+    write_singularity(
+        FIXTURE_DIRECTORY / "format_singularite.xlsx"
     )
     write_csv(FIXTURE_DIRECTORY / "format_csv.csv", rows)
 

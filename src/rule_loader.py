@@ -28,7 +28,16 @@ REQUIRED_RULE_COLUMNS = [
     "enabled",
 ]
 
+# Colonnes facultatives. Leur absence ne bloque pas le
+# chargement : la valeur est alors déduite de la catégorie de la
+# règle.
+OPTIONAL_RULE_COLUMNS = [
+    "smart_dimension",
+]
+
 ALLOWED_SEVERITIES = set(config.ALLOWED_SEVERITIES)
+
+ALLOWED_SMART_AXES = set(config.SMART_ALLOWED_AXES)
 
 TRUE_VALUES = {
     "true",
@@ -74,6 +83,11 @@ class Rule:
     rewrite_template: str
     enabled: bool
     compiled_pattern: Pattern[str]
+
+    # Axe SMART, ou axe de singularité, mis en défaut par la
+    # règle. Résolu au chargement : la colonne du catalogue
+    # prime, sinon la catégorie décide.
+    smart_dimension: str = config.SMART_DEFAULT_DIMENSION
 
     def matches(self, text: str) -> bool:
         """
@@ -138,6 +152,7 @@ class Rule:
             ),
             "rewrite_template": self.rewrite_template,
             "enabled": self.enabled,
+            "smart_dimension": self.smart_dimension,
         }
 
 
@@ -278,6 +293,44 @@ def compile_rule_pattern(
         ) from error
 
 
+def resolve_smart_dimension(
+    declared_value,
+    category: str,
+    rule_id: str,
+    row_number: int,
+) -> str:
+    """
+    Détermine l'axe SMART mis en défaut par une règle.
+
+    La colonne smart_dimension du catalogue prime. Quand elle
+    est vide ou absente, l'axe est déduit de la catégorie de la
+    règle. Une catégorie inconnue est rattachée à l'axe par
+    défaut, pour qu'une règle nouvelle soit toujours comptée
+    quelque part plutôt que perdue.
+    """
+
+    declared = normalize_text(declared_value).upper().replace(
+        "-",
+        "_",
+    )
+
+    if declared:
+        if declared not in ALLOWED_SMART_AXES:
+            raise ValueError(
+                f"Ligne CSV {row_number}, règle '{rule_id}' : "
+                f"axe SMART invalide '{declared}'. "
+                f"Valeurs admises : "
+                f"{', '.join(sorted(ALLOWED_SMART_AXES))}."
+            )
+
+        return declared
+
+    return config.CATEGORY_TO_SMART_DIMENSION.get(
+        category,
+        config.SMART_DEFAULT_DIMENSION,
+    )
+
+
 # ============================================================
 # Création d'une règle depuis une ligne CSV
 # ============================================================
@@ -351,6 +404,13 @@ def build_rule_from_row(
         row_number=row_number,
     )
 
+    smart_dimension = resolve_smart_dimension(
+        declared_value=row.get("smart_dimension", ""),
+        category=category,
+        rule_id=rule_id,
+        row_number=row_number,
+    )
+
     return Rule(
         rule_id=rule_id,
         category=category,
@@ -361,6 +421,7 @@ def build_rule_from_row(
         rewrite_template=rewrite_template,
         enabled=enabled,
         compiled_pattern=compiled_pattern,
+        smart_dimension=smart_dimension,
     )
 
 
@@ -461,10 +522,15 @@ def load_rules(
 
     validate_csv_columns(dataframe)
 
-    # Conservation uniquement des colonnes prévues.
-    dataframe = dataframe[
-        REQUIRED_RULE_COLUMNS
-    ].copy()
+    # Conservation des colonnes prévues, et des colonnes
+    # facultatives réellement présentes dans le fichier.
+    retained_columns = REQUIRED_RULE_COLUMNS + [
+        column
+        for column in OPTIONAL_RULE_COLUMNS
+        if column in dataframe.columns
+    ]
+
+    dataframe = dataframe[retained_columns].copy()
 
     all_valid_rules: list[Rule] = []
     errors: list[str] = []
@@ -553,6 +619,13 @@ def load_rules(
             severities.get(rule.severity, 0) + 1
         )
 
+    smart_axes = {}
+
+    for rule in enabled_rules:
+        smart_axes[rule.smart_dimension] = (
+            smart_axes.get(rule.smart_dimension, 0) + 1
+        )
+
     diagnostics = {
         "file_name": path.name,
         "file_path": str(path),
@@ -567,6 +640,9 @@ def load_rules(
         ),
         "severities": dict(
             sorted(severities.items())
+        ),
+        "smart_axes": dict(
+            sorted(smart_axes.items())
         ),
     }
 
@@ -684,6 +760,7 @@ def load_rule_catalog(
 
     categories: dict[str, int] = {}
     severities: dict[str, int] = {}
+    smart_axes: dict[str, int] = {}
 
     for rule in all_valid_rules:
         if not rule.enabled:
@@ -694,6 +771,9 @@ def load_rule_catalog(
         )
         severities[rule.severity] = (
             severities.get(rule.severity, 0) + 1
+        )
+        smart_axes[rule.smart_dimension] = (
+            smart_axes.get(rule.smart_dimension, 0) + 1
         )
 
     diagnostics = {
@@ -710,6 +790,7 @@ def load_rule_catalog(
         "error_count": len(errors),
         "categories": dict(sorted(categories.items())),
         "severities": dict(sorted(severities.items())),
+        "smart_axes": dict(sorted(smart_axes.items())),
     }
 
     return {

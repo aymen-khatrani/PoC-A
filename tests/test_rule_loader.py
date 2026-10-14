@@ -4,6 +4,7 @@
 
 import pytest
 
+from src import config
 from src.rule_loader import (
     expand_catalog_paths,
     load_rule_catalog,
@@ -80,6 +81,80 @@ class TestChargementCatalogue:
 
         with pytest.raises(ValueError, match="régulière invalide"):
             load_rules(path)
+
+
+class TestAxeSmart:
+    """Chaque règle porte l'axe SMART qu'elle met en défaut."""
+
+    def test_toutes_les_regles_portent_un_axe(self) -> None:
+        for rule in load_rules(CATALOG)["rules"]:
+            assert rule.smart_dimension in config.SMART_ALLOWED_AXES
+
+    def test_axe_declare_dans_le_catalogue(self) -> None:
+        par_identifiant = {
+            rule.rule_id: rule
+            for rule in load_rules(CATALOG)["rules"]
+        }
+
+        # « as soon as possible » est un défaut de délai, pas de
+        # mesurabilité : le catalogue le déclare explicitement.
+        assert (
+            par_identifiant["VER-001"].smart_dimension
+            == config.SMART_TIME_BOUND
+        )
+
+    def test_axe_deduit_de_la_categorie(self, tmp_path) -> None:
+        contenu = (
+            "rule_id,category,pattern,severity,explanation,"
+            "clarification_question,rewrite_template,enabled\n"
+            "T-1,WEAK_OBLIGATION,\\bshould\\b,MEDIUM,e,q,r,true\n"
+        )
+
+        path = tmp_path / "sans_axe.csv"
+        path.write_text(contenu, encoding="utf-8")
+
+        rule = load_rules(path)["rules"][0]
+
+        assert rule.smart_dimension == config.SMART_ACHIEVABLE
+
+    def test_categorie_inconnue_rattachee_a_l_axe_par_defaut(
+        self,
+        tmp_path,
+    ) -> None:
+        contenu = (
+            "rule_id,category,pattern,severity,explanation,"
+            "clarification_question,rewrite_template,enabled\n"
+            "T-1,NOUVELLE_CATEGORIE,\\bfast\\b,HIGH,e,q,r,true\n"
+        )
+
+        path = tmp_path / "categorie_inconnue.csv"
+        path.write_text(contenu, encoding="utf-8")
+
+        rule = load_rules(path)["rules"][0]
+
+        assert rule.smart_dimension == config.SMART_DEFAULT_DIMENSION
+
+    def test_axe_invalide_rejete(self, tmp_path) -> None:
+        contenu = (
+            "rule_id,category,pattern,severity,explanation,"
+            "clarification_question,rewrite_template,enabled,"
+            "smart_dimension\n"
+            "T-1,AMBIGUITY,\\bfast\\b,HIGH,e,q,r,true,URGENT\n"
+        )
+
+        path = tmp_path / "axe.csv"
+        path.write_text(contenu, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="axe SMART invalide"):
+            load_rules(path)
+
+    def test_axes_comptes_dans_les_diagnostics(self) -> None:
+        diagnostics = load_rule_catalog("rules")["diagnostics"]
+
+        assert diagnostics["smart_axes"]
+        assert sum(diagnostics["smart_axes"].values()) == (
+            diagnostics["enabled_rule_count"]
+        )
 
 
 class TestCatalogueMultiFichiers:

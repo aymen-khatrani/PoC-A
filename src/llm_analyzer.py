@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 
@@ -35,8 +35,18 @@ from src.config import (
     CANONICAL_ID,
     CANONICAL_TEXT,
     CANONICAL_TYPE,
+    SOURCE_ROW,
+    SOURCE_SHEET,
+    EngineSettings,
 )
-from src.rule_engine import build_llm_findings
+from src.rule_engine import (
+    FINDING_COLUMNS,
+    Finding,
+    build_llm_findings,
+    read_source_row,
+    rebuild_findings,
+    summarise_requirement,
+)
 from src.text_utils import clean_value
 
 
@@ -71,6 +81,10 @@ LLM_RESULT_COLUMNS = [
     "LLM_Rejected_Rules",
     "LLM_Confirmed_Detail",
     "LLM_Rejected_Detail",
+    "LLM_Added_Count",
+    "LLM_Added_Findings",
+    "LLM_Added_Detail",
+    "LLM_Discarded_Findings",
     "LLM_Missing_Information",
     "LLM_Clarification_Questions",
     "LLM_Proposed_Rewrite",
@@ -155,6 +169,12 @@ class LLMAnalysis:
     rejected_findings: list[dict[str, str]] = field(
         default_factory=list
     )
+    # Constats que le modèle a ajoutés, et motifs de ceux qui
+    # ont été écartés faute de preuve vérifiable.
+    added_findings: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    discarded_findings: list[str] = field(default_factory=list)
     missing_information: list[str] = field(default_factory=list)
     clarification_questions: list[str] = field(
         default_factory=list
@@ -198,6 +218,19 @@ class LLMAnalysis:
             "LLM_Rejected_Detail": json.dumps(
                 self.rejected_findings,
                 ensure_ascii=False,
+            ),
+            "LLM_Added_Count": len(self.added_findings),
+            "LLM_Added_Findings": " | ".join(
+                f"{item['rule_id']} [{item['smart_dimension']}, "
+                f"{item['severity']}] {item['evidence']}"
+                for item in self.added_findings
+            ),
+            "LLM_Added_Detail": json.dumps(
+                self.added_findings,
+                ensure_ascii=False,
+            ),
+            "LLM_Discarded_Findings": " | ".join(
+                self.discarded_findings
             ),
             "LLM_Missing_Information": " | ".join(
                 self.missing_information
@@ -385,6 +418,108 @@ def ensure_assessment_list(value: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
+# Constats ajoutés par le modèle
+# ============================================================
+
+def parse_additional_findings(
+    value: Any,
+    requirement_text: str,
+    maximum: int = config.MODEL_MAXIMUM_ADDED_FINDINGS,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Valide les constats que le modèle a ajoutés de lui-même.
+
+    Un constat n'est retenu que si son passage se retrouve mot
+    pour mot dans l'exigence. C'est la même exigence de preuve
+    que pour une règle : on ne signale pas un défaut sans
+    pouvoir montrer où il se trouve. Cette vérification est ce
+    qui permet d'accorder au modèle un rôle de détection sans
+    lui accorder le droit d'inventer.
+
+    Retour :
+        (constats retenus, motifs des constats écartés)
+    """
+
+    if value in (None, ""):
+        return [], []
+
+    if not isinstance(value, list):
+        return [], [
+            "Le champ additional_findings n'est pas une liste."
+        ]
+
+    haystack = clean_value(requirement_text).casefold()
+
+    retained: list[dict[str, Any]] = []
+    discarded: list[str] = []
+
+    for position, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            discarded.append(
+                f"Constat {position} : format inattendu."
+            )
+            continue
+
+        evidence = clean_value(item.get("evidence"))
+        axis = clean_value(item.get("quality_criterion")).upper()
+        severity = clean_value(item.get("severity")).upper()
+
+        if not evidence:
+            discarded.append(
+                f"Constat {position} : aucune preuve citée."
+            )
+            continue
+
+        if evidence.casefold() not in haystack:
+            discarded.append(
+                f"Constat {position} : le passage {evidence!r} "
+                "ne figure pas dans l'exigence."
+            )
+            continue
+
+        if axis not in config.SMART_ALLOWED_AXES:
+            discarded.append(
+                f"Constat {position} : critère qualité "
+                f"{axis!r} inconnu."
+            )
+            continue
+
+        if severity not in config.MODEL_ALLOWED_SEVERITIES:
+            discarded.append(
+                f"Constat {position} : gravité {severity!r} "
+                "non autorisée pour un constat du modèle."
+            )
+            continue
+
+        if len(retained) >= maximum:
+            discarded.append(
+                f"Constat {position} : au-delà des {maximum} "
+                "constats autorisés."
+            )
+            continue
+
+        retained.append(
+            {
+                "rule_id": (
+                    f"{config.MODEL_FINDING_PREFIX}-"
+                    f"{len(retained) + 1:03d}"
+                ),
+                "smart_dimension": axis,
+                "severity": severity,
+                "evidence": evidence,
+                "explanation": clean_value(
+                    item.get("explanation")
+                ),
+                "clarification_question": clean_value(
+                    item.get("clarification_question")
+                ),
+            }
+        )
+
+    return retained, discarded
+
+
+# ============================================================
 # Décision calculée en Python
 # ============================================================
 
@@ -461,6 +596,43 @@ def build_response_schema(rule_ids: list[str]) -> dict[str, Any]:
                     ],
                 },
             },
+            # Le modèle peut signaler un défaut qu'aucune règle
+            # ne décrit. Le passage cité est vérifié mot pour
+            # mot contre l'exigence : un constat dont la preuve
+            # est introuvable est écarté.
+            "additional_findings": {
+                "type": "array",
+                "maxItems": config.MODEL_MAXIMUM_ADDED_FINDINGS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "quality_criterion": {
+                            "type": "string",
+                            "enum": sorted(
+                                config.SMART_ALLOWED_AXES
+                            ),
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": list(
+                                config.MODEL_ALLOWED_SEVERITIES
+                            ),
+                        },
+                        "evidence": {"type": "string"},
+                        "explanation": {"type": "string"},
+                        "clarification_question": {
+                            "type": "string"
+                        },
+                    },
+                    "required": [
+                        "quality_criterion",
+                        "severity",
+                        "evidence",
+                        "explanation",
+                        "clarification_question",
+                    ],
+                },
+            },
             "missing_information": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -492,6 +664,7 @@ def build_response_schema(rule_ids: list[str]) -> dict[str, Any]:
         },
         "required": [
             "findings_assessment",
+            "additional_findings",
             "missing_information",
             "clarification_questions",
             "proposed_rewrite",
@@ -535,6 +708,15 @@ def build_system_prompt() -> str:
         "false only when it is clearly absent in this "
         "context.\n\n"
 
+        "You have two tasks. First, judge every finding "
+        "supplied by the rule engine. Second, report a defect "
+        "that the rule engine missed, when you find one: "
+        "lexical rules cannot see a requirement that asks to "
+        "reduce a phenomenon without stating by how much, or "
+        "one whose verification method cannot exist. This "
+        "second task is where your judgement adds what the "
+        "rules cannot.\n\n"
+
         "Assess the requirement against these dimensions, and "
         "only those that are relevant to it: obligation "
         "clarity, responsible actor, required action, affected "
@@ -574,9 +756,17 @@ def build_user_prompt(
     requirement_text: str,
     object_type: str,
     findings: list[dict[str, Any]],
-    schema: dict[str, Any],
+    schema: dict[str, Any] | None = None,
 ) -> str:
-    """Construit le prompt d'analyse d'une exigence."""
+    """
+    Construit le prompt d'analyse d'une exigence.
+
+    Le schéma n'est rappelé dans le prompt que lorsqu'il n'est
+    pas déjà imposé par le format de réponse. Le répéter dans
+    les deux endroits consommait près d'un cinquième du prompt
+    pour rien, et cette place est précieuse sur un modèle local
+    de petite taille.
+    """
 
     payload = {
         "requirement_id": requirement_id,
@@ -625,16 +815,45 @@ def build_user_prompt(
         "established from the context, use a placeholder for "
         "it.\n"
         "11. Write a grammatically complete statement.\n\n"
+        "ADDITIONAL FINDINGS:\n"
+        "12. Use additional_findings only for a defect that "
+        "none of the supplied rules already describes. Return "
+        "an empty list when the supplied findings already cover "
+        "every defect, and when the requirement is sound.\n"
+        "13. The evidence of an additional finding must be "
+        "copied character for character from "
+        "original_requirement. If you cannot copy the exact "
+        "wording that carries the defect, do not report the "
+        "finding at all: a finding without verifiable evidence "
+        "is discarded.\n"
+        "14. Pick the quality_criterion that the defect "
+        "breaks: SPECIFIC for an unclear actor, action or "
+        "object; MEASURABLE for a result that cannot be "
+        "quantified or verified; ACHIEVABLE for an obligation "
+        "that is not firm or not feasible; RELEVANT for "
+        "information that is missing; TIME_BOUND for a missing "
+        "deadline, duration or frequency; SINGULARITY when the "
+        "statement carries more than one obligation.\n"
+        "15. Do not restate a rule finding under a different "
+        "wording, and do not report a defect about the "
+        "technical solution requested by the customer.\n\n"
+
         "RISK:\n"
-        "12. Recommend a risk only when the unresolved defect "
+        "16. Recommend a risk only when the unresolved defect "
         "can plausibly affect interpretation, verification, "
         "acceptance, safety, cost or schedule.\n"
-        "13. If risk_recommended is false, return empty "
+        "17. If risk_recommended is false, return empty "
         "strings and an empty list in risk_draft.\n\n"
         "OUTPUT:\n"
-        "14. Return exactly one JSON object matching this "
-        "schema, with no Markdown and no commentary:\n"
-        + json.dumps(schema, ensure_ascii=False)
+        "18. Return exactly one JSON object, with no Markdown "
+        "and no commentary."
+        + (
+            " It must match this schema:\n"
+            + json.dumps(schema, ensure_ascii=False)
+            if schema is not None
+            else " Its structure is already enforced by the "
+            "response format."
+        )
     )
 
 
@@ -781,7 +1000,13 @@ class LLMAnalyzer:
                         requirement_text=requirement_text,
                         object_type=object_type,
                         findings=findings,
-                        schema=schema,
+                        # Rappelé seulement en repli, quand la
+                        # grammaire de sortie n'est pas imposée.
+                        schema=(
+                            None
+                            if settings.use_json_schema
+                            else schema
+                        ),
                     ),
                 },
             ],
@@ -809,6 +1034,7 @@ class LLMAnalyzer:
         self,
         parsed: dict[str, Any],
         expected_rule_ids: set[str],
+        requirement_text: str = "",
     ) -> dict[str, Any]:
         """
         Contrôle et interprète la réponse du modèle.
@@ -905,10 +1131,17 @@ class LLMAnalyzer:
             else LLMRiskDraft()
         )
 
+        added, discarded = parse_additional_findings(
+            value=parsed.get("additional_findings"),
+            requirement_text=requirement_text,
+        )
+
         return {
             "decision": decision,
             "confirmed": confirmed,
             "rejected": rejected,
+            "added": added,
+            "discarded": discarded,
             "missing_information": ensure_string_list(
                 parsed.get("missing_information")
             ),
@@ -999,6 +1232,7 @@ class LLMAnalyzer:
                 interpreted = self.interpret_response(
                     parsed=parse_json_response(raw_response),
                     expected_rule_ids=set(rule_ids),
+                    requirement_text=truncated_text,
                 )
 
                 generated = int(
@@ -1025,6 +1259,8 @@ class LLMAnalyzer:
                 result.decision = interpreted["decision"]
                 result.confirmed_findings = interpreted["confirmed"]
                 result.rejected_findings = interpreted["rejected"]
+                result.added_findings = interpreted["added"]
+                result.discarded_findings = interpreted["discarded"]
                 result.missing_information = interpreted[
                     "missing_information"
                 ]
@@ -1124,6 +1360,20 @@ def select_llm_candidates(
         lambda value: config.SEVERITY_RANK.get(str(value), 0)
     )
 
+    # Un énoncé à scinder peut ne déclencher aucune règle
+    # lexicale. Il doit pourtant être approfondi : c'est
+    # précisément un défaut de structure que le modèle sait
+    # décrire, et que les expressions régulières ne voient
+    # qu'en partie.
+    # La colonne reste facultative : un tableau produit par une
+    # version antérieure doit continuer à être sélectionnable.
+    to_split = (
+        candidates["Singularity_Status"]
+        == config.SINGULARITY_TO_SPLIT
+        if "Singularity_Status" in candidates.columns
+        else pd.Series(False, index=candidates.index)
+    )
+
     if include_clean:
         keep = candidates["_rank"] >= minimum_rank
         keep |= candidates["Issue_Count"] == 0
@@ -1131,13 +1381,19 @@ def select_llm_candidates(
         keep = (candidates["Issue_Count"] > 0) & (
             candidates["_rank"] >= minimum_rank
         )
+        keep |= to_split
 
     candidates = candidates[keep].copy()
 
+    candidates["_to_split"] = to_split.reindex(
+        candidates.index,
+        fill_value=False,
+    )
+
     candidates = candidates.sort_values(
-        by=["_rank", "Quality_Score", "Issue_Count"],
-        ascending=[False, True, False],
-    ).drop(columns=["_rank"])
+        by=["_to_split", "_rank", "Quality_Score", "Issue_Count"],
+        ascending=[False, False, True, False],
+    ).drop(columns=["_rank", "_to_split"])
 
     if limit is not None and limit >= 0:
         candidates = candidates.head(limit)
@@ -1296,6 +1552,57 @@ def analyze_batch(
 # Fusion avec le résumé des règles
 # ============================================================
 
+def reconcile_recommended_action(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aligne l'action recommandée sur l'avis du modèle.
+
+    Sans cette étape, deux lectures coexistaient dans le même
+    rapport : les règles demandaient une correction en tête de
+    page, alors que le modèle avait déjà jugé le constat non
+    fondé. C'est la lecture la moins informée qui s'affichait.
+
+    Une fausse alerte remplace l'action. Un avis réservé la
+    préfixe sans l'effacer : le doute du modèle ne vaut pas
+    décision. Une absence d'avis ne change rien, car elle ne
+    peut jamais être lue comme un avis favorable.
+    """
+
+    if "Recommended_Action" not in frame.columns:
+        return frame
+
+    if "LLM_Decision" not in frame.columns:
+        return frame
+
+    result = frame.copy()
+
+    for position, decision in enumerate(result["LLM_Decision"]):
+        key = clean_value(decision).upper()
+
+        override = config.LLM_DECISION_ACTION_OVERRIDE.get(key)
+
+        if override:
+            result.iloc[
+                position,
+                result.columns.get_loc("Recommended_Action"),
+            ] = override
+
+            continue
+
+        prefix = config.LLM_DECISION_ACTION_PREFIX.get(key)
+
+        if prefix:
+            current = clean_value(
+                result.iloc[position]["Recommended_Action"]
+            )
+
+            result.iloc[
+                position,
+                result.columns.get_loc("Recommended_Action"),
+            ] = f"{prefix}. {current}"
+
+    return result
+
+
 def merge_llm_results(
     summary_frame: pd.DataFrame,
     llm_frame: pd.DataFrame,
@@ -1344,7 +1651,275 @@ def merge_llm_results(
         if column in merged.columns:
             merged[column] = merged[column].fillna("")
 
-    return merged
+    return reconcile_recommended_action(merged)
+
+
+# ============================================================
+# Revue du modèle appliquée au verdict
+# ============================================================
+#
+# Sans cette étape, l'avis du modèle restait décoratif : les
+# règles décidaient du statut, du score et des axes, et le
+# modèle commentait à côté. Une exigence dont tous les constats
+# étaient jugés infondés gardait un verdict sévère.
+#
+# Après cette étape, le verdict présenté est le meilleur
+# disponible : constats de règles écartés par le modèle retirés,
+# constats du modèle ajoutés. Le verdict issu des seules règles
+# est conservé dans des colonnes dédiées, pour que l'arbitrage
+# reste auditable.
+#
+# ============================================================
+
+def split_rule_list(value: Any) -> set[str]:
+    """Lit une liste d'identifiants de règles sérialisée."""
+
+    text = clean_value(value)
+
+    if not text:
+        return set()
+
+    return {
+        part.strip()
+        for part in text.split("|")
+        if part.strip()
+    }
+
+
+def build_model_findings(
+    requirement_id: str,
+    requirement_text: str,
+    added: list[dict[str, Any]],
+    source_excel_row: int | None,
+) -> list[Finding]:
+    """
+    Convertit les constats du modèle en constats de plein droit.
+
+    La position du passage est retrouvée dans le texte : elle
+    permet de l'encadrer dans le texte annoté, exactement comme
+    pour un constat de règle. Un constat dont le passage ne
+    serait plus retrouvable est ignoré, par prudence : la
+    validation l'a déjà vérifié en amont.
+    """
+
+    findings: list[Finding] = []
+    lowered = requirement_text.casefold()
+
+    for position, item in enumerate(added, start=1):
+        evidence = clean_value(item.get("evidence"))
+        start = lowered.find(evidence.casefold())
+
+        if start < 0:
+            continue
+
+        findings.append(
+            Finding(
+                requirement_id=requirement_id,
+                rule_id=clean_value(item.get("rule_id"))
+                or f"{config.MODEL_FINDING_PREFIX}-{position:03d}",
+                category=config.MODEL_FINDING_CATEGORY,
+                smart_dimension=clean_value(
+                    item.get("smart_dimension")
+                ),
+                severity=clean_value(item.get("severity")),
+                evidence=requirement_text[
+                    start : start + len(evidence)
+                ],
+                start_position=start,
+                end_position=start + len(evidence),
+                occurrence_index=1,
+                explanation=clean_value(item.get("explanation")),
+                clarification_question=clean_value(
+                    item.get("clarification_question")
+                ),
+                # Le modèle ne propose pas de patron : sa
+                # reformulation complète figure déjà dans sa
+                # propre colonne.
+                rewrite_template="",
+                source_excel_row=source_excel_row,
+                source=config.FINDING_SOURCE_MODEL,
+            )
+        )
+
+    return findings
+
+
+def read_added_findings(value: Any) -> list[dict[str, Any]]:
+    """Relit les constats du modèle sérialisés en JSON."""
+
+    text = clean_value(value)
+
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+
+    return parsed if isinstance(parsed, list) else []
+
+
+# Colonnes recalculées après la revue. Les colonnes centrées
+# sur les règles, comme Triggered_Rules ou Issue_Count, ne le
+# sont pas : elles décrivent le catalogue, pas le verdict.
+REVIEWED_COLUMNS = [
+    "Quality_Status",
+    "Quality_Score",
+    "SMART_Score",
+    "SMART_Profile",
+    "SMART_Compliant_Axes",
+    "SMART_Failed_Axes",
+    "SMART_Axes_To_Check",
+    "Singularity_Status",
+    "Recommended_Action",
+    "Annotated_Text",
+    "Clarification_Questions",
+    "Risk_To_Assess",
+    "Risk_Draft",
+]
+
+# Verdict d'origine conservé pour l'audit.
+RULE_ONLY_COLUMNS = {
+    "Quality_Status": "Rule_Quality_Status",
+    "SMART_Score": "Rule_SMART_Score",
+    "SMART_Profile": "Rule_SMART_Profile",
+}
+
+
+def apply_model_review(
+    summary_frame: pd.DataFrame,
+    findings_frame: pd.DataFrame,
+    engine_settings: EngineSettings | None = None,
+) -> dict[str, Any]:
+    """
+    Recalcule le verdict en tenant compte de la revue du modèle.
+
+    Seules les exigences réellement analysées par le modèle sont
+    touchées. Les autres conservent leur verdict de règles, et
+    leurs colonnes d'audit répètent ce verdict : une absence
+    d'avis ne doit jamais ressembler à un avis.
+
+    Retour :
+        {
+            "summary":     résumé avec le verdict revu,
+            "findings":    constats de règles et du modèle,
+            "diagnostics": apport mesuré du modèle,
+        }
+    """
+
+    engine_settings = engine_settings or EngineSettings()
+
+    summary = summary_frame.copy()
+
+    for source_column, audit_column in RULE_ONLY_COLUMNS.items():
+        summary[audit_column] = summary[source_column]
+
+    if "LLM_Analyzed" not in summary.columns:
+        return {
+            "summary": summary,
+            "findings": findings_frame,
+            "diagnostics": {
+                "reviewed_count": 0,
+                "added_finding_count": 0,
+                "dropped_finding_count": 0,
+                "status_improved_count": 0,
+                "status_worsened_count": 0,
+            },
+        }
+
+    model_rows: list[dict[str, Any]] = []
+    added_total = 0
+    dropped_total = 0
+    reviewed_total = 0
+    improved = 0
+    worsened = 0
+
+    for position, row in summary.iterrows():
+        if clean_value(row.get("LLM_Analyzed")) != "YES":
+            continue
+
+        requirement_id = clean_value(row.get(CANONICAL_ID))
+        text = clean_value(row.get(CANONICAL_TEXT))
+        source_excel_row = read_source_row(row.get(SOURCE_ROW))
+
+        rejected = split_rule_list(row.get("LLM_Rejected_Rules"))
+
+        rule_findings = [
+            finding
+            for finding in rebuild_findings(
+                findings_frame=findings_frame,
+                requirement_id=requirement_id,
+            )
+            if finding.rule_id not in rejected
+        ]
+
+        model_findings = build_model_findings(
+            requirement_id=requirement_id,
+            requirement_text=text,
+            added=read_added_findings(row.get("LLM_Added_Detail")),
+            source_excel_row=source_excel_row,
+        )
+
+        reviewed_total += 1
+        added_total += len(model_findings)
+        dropped_total += len(rejected)
+
+        model_rows.extend(
+            finding.to_row() for finding in model_findings
+        )
+
+        reviewed = summarise_requirement(
+            requirement_id=requirement_id,
+            text=text,
+            object_type=clean_value(row.get(CANONICAL_TYPE)),
+            source_excel_row=source_excel_row,
+            source_sheet=clean_value(row.get(SOURCE_SHEET)),
+            findings=rule_findings + model_findings,
+            settings=engine_settings,
+        )
+
+        before = config.STATUS_PRIORITY.get(
+            clean_value(row.get("Quality_Status")),
+            0,
+        )
+        after = config.STATUS_PRIORITY.get(
+            reviewed["Quality_Status"],
+            0,
+        )
+
+        # La priorité décroît avec la gravité : un rang plus
+        # élevé signifie une exigence moins inquiétante.
+        if after > before:
+            improved += 1
+        elif after < before:
+            worsened += 1
+
+        for column in REVIEWED_COLUMNS:
+            summary.at[position, column] = reviewed[column]
+
+    combined = findings_frame
+
+    if model_rows:
+        combined = pd.concat(
+            [
+                findings_frame,
+                pd.DataFrame(model_rows, columns=FINDING_COLUMNS),
+            ],
+            ignore_index=True,
+        )
+
+    return {
+        "summary": summary,
+        "findings": combined,
+        "diagnostics": {
+            "reviewed_count": reviewed_total,
+            "added_finding_count": added_total,
+            "dropped_finding_count": dropped_total,
+            "status_improved_count": improved,
+            "status_worsened_count": worsened,
+        },
+    }
 
 
 # ============================================================

@@ -41,10 +41,8 @@ from typing import Any
 
 import pandas as pd
 
-from src import config
 from src.config import (
     CANONICAL_ID,
-    CANONICAL_TEXT,
     EngineSettings,
     LoaderSettings,
 )
